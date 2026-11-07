@@ -7,10 +7,18 @@ has to remember to keep the two operators in sync.
 
 from dataclasses import replace
 
+from ray.data._internal.datasource_v2.common.listing_pruning import ListingPruningHint
 from ray.data._internal.datasource_v2.common.pushdown_utils import (
     derive_list_files_pushdown,
 )
+from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
+    FooterFileIndexer,
+)
+from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
+    ParquetScanner,
+)
 from ray.data._internal.logical.interfaces import LogicalOperator, LogicalPlan, Rule
+from ray.data._internal.logical.operators.map_operator import Filter
 from ray.data._internal.logical.operators.read_operator import ListFiles, ReadFiles
 
 __all__ = [
@@ -26,6 +34,7 @@ class DeriveListFilesPushdown(Rule):
     derives that state from the scanner once, after the optimize loop, instead
     of having every pushdown rule mirror onto ``ListFiles``. Non-``ReadFiles``
     consumers (e.g. after ``PushdownCountFiles``) clear the constraints.
+    A separate residual hint is backed by the retained Filter, never exact count.
 
     The limit is never derived onto a ``ListFiles`` that shuffles row groups
     (``FileShuffleConfig.small_chunks_shuffle``): the shuffle runs on the listed
@@ -78,8 +87,62 @@ class DeriveListFilesPushdown(Rule):
                 return node
             return node._with_new_input_dependencies(new_inputs)
 
-        dag = plan.dag._apply_transform(transform)
+        def clear_listing_hint(node: LogicalOperator) -> LogicalOperator:
+            if not isinstance(node, ListFiles):
+                return node
+            # Only the first, explicitly admitted built-in adapter owns hints.
+            # Do not call a new hook on arbitrary indexers or their subclasses.
+            if type(node.file_indexer) is not FooterFileIndexer:
+                return node
+            indexer = node.file_indexer.with_listing_hint(None)
+            if indexer is node.file_indexer:
+                return node
+            return replace(node, file_indexer=indexer)
 
+        # Clear every source before any future eligibility early return. This
+        # includes bare ListFiles and sources whose ReadFiles disappeared.
+        # Clearing clones capable indexers, never shared configurations.
+        dag = plan.dag._apply_transform(clear_listing_hint)
+        dag = dag._apply_transform(transform)
+
+        # Ordinary row queries first. This is a structural scope restriction,
+        # not a complete-consumption/error-preservation gate. Other roots decline.
+        if (
+            type(dag) is Filter
+            and len(dag.input_dependencies) == 1
+            and not plan.context.execution_options.preserve_order
+            and plan.context.max_errored_blocks == 0
+            and plan.context.checkpoint_config is None
+        ):
+            read = dag.input_dependencies[0]
+            if (
+                type(read) is ReadFiles
+                and read.block_udf is None
+                and type(read.scanner) is ParquetScanner
+                and read.scanner.limit is None
+                and len(read.input_dependencies) == 1
+            ):
+                listing = read.input_dependencies[0]
+                if (
+                    type(listing) is ListFiles
+                    and type(listing.file_indexer) is FooterFileIndexer
+                    and listing.limit is None
+                    and listing.shuffle_config_factory() is None
+                ):
+                    context = read.scanner.listing_pruning_context()
+                    residual = dag.predicate_expr
+                    hint = (
+                        ListingPruningHint.from_residual(context, residual)
+                        if context is not None and residual is not None
+                        else None
+                    )
+                    if hint is not None:
+                        configured = replace(
+                            listing,
+                            file_indexer=listing.file_indexer.with_listing_hint(hint),
+                        )
+                        read = read._with_new_input_dependencies([configured])
+                        dag = dag._with_new_input_dependencies([read])
         return LogicalPlan(dag=dag, context=plan.context)
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from collections import deque
 from typing import TYPE_CHECKING, AbstractSet, Deque, Iterable, Iterator, List, Optional
@@ -28,6 +29,9 @@ if TYPE_CHECKING:
     from pyarrow.fs import FileSystem
 
     from ray.actor import ActorProxy
+    from ray.data._internal.datasource_v2.common.listing_pruning import (
+        ListingPruningHint,
+    )
     from ray.data._internal.datasource_v2.formats.parquet.footer_reader import (
         FooterReader,
     )
@@ -157,6 +161,7 @@ class FooterFileIndexer(NonSamplingFileIndexer):
             num_workers=num_workers,
             max_paths_per_output=max_paths_per_output,
         )
+        self._listing_hint: Optional[ListingPruningHint] = None
         self._coalesce_bytes = coalesce_bytes
         # Coalesce target used instead of ``coalesce_bytes`` (when larger) for a
         # row-group shuffle, so the shuffle unit is a ~chunk-sized run rather
@@ -201,6 +206,18 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         self._max_inflight_batches = (
             _inflight if _inflight is not None else self._num_actors * 2
         )
+
+    def with_listing_hint(
+        self, hint: Optional["ListingPruningHint"]
+    ) -> "FooterFileIndexer":
+        # A subclass must make its own explicit semantic admission decision.
+        if type(self) is not FooterFileIndexer:
+            return self
+        if self._listing_hint is hint:
+            return self
+        configured = copy.copy(self)
+        configured._listing_hint = hint
+        return configured
 
     def list_files(
         self,
@@ -299,6 +316,14 @@ class FooterFileIndexer(NonSamplingFileIndexer):
                 projected_columns,
                 coalesce_bytes,
                 excluded_read_unit_ids=excluded_read_unit_ids,
+                listing_hint=(
+                    self._listing_hint
+                    if not preserve_order
+                    and limit is None
+                    and shuffle_config is None
+                    and not excluded_read_unit_ids
+                    else None
+                ),
             )
             for _ in range(self._num_actors)
         ]

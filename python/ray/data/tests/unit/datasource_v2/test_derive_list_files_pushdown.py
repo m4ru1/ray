@@ -48,6 +48,15 @@ from ray.data.datasource.partitioning import Partitioning, PartitionStyle
 from ray.data.expressions import col
 
 
+def _footer_indexer(value):
+    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
+        FooterFileIndexer,
+    )
+
+    assert isinstance(value, FooterFileIndexer)
+    return value
+
+
 def _mk_read_files(tmp_path: Path) -> ReadFiles:
     """A minimal ``ListFiles -> ReadFiles`` chain over one Parquet file."""
     f = tmp_path / "data.parquet"
@@ -352,6 +361,145 @@ def test_block_udf_filter_keeps_listing_and_read_limit_unset(tmp_path, columns):
     assert listing.predicate is None
     assert listing.partition_pruner is None
     assert listing.limit is None
+
+
+def _previous_hint():
+    from ray.data._internal.datasource_v2.common.listing_pruning import (
+        ListingPruningHint,
+    )
+    from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
+        ParquetScanner,
+    )
+
+    scanner = ParquetScanner(
+        schema=pa.schema([("a", pa.int64()), ("p", pa.string())]),
+        partitioning=Partitioning(PartitionStyle.HIVE, field_names=["p"]),
+    )
+    context = scanner.listing_pruning_context()
+    assert context is not None
+    return ListingPruningHint.from_residual(context, (col("p") == "a") | (col("a") > 9))
+
+
+@pytest.mark.parametrize(
+    "shape", ["bare", "read", "filter", "count", "non_read", "declined_scanner"]
+)
+def test_stale_hint_cleared_before_any_root_qualification(tmp_path, shape):
+    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
+        FooterFileIndexer,
+    )
+    from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
+        ParquetScanner,
+    )
+    from ray.data._internal.logical.operators.count_operator import Count
+
+    original = FooterFileIndexer(ignore_missing_paths=False)
+    hint = _previous_hint()
+    configured = original.with_listing_hint(hint)
+    read = _mk_read_files(tmp_path)
+    listing = replace(_source_list_files(read), file_indexer=configured)
+    q = col("a") > 1
+    assert isinstance(read.scanner, ParquetScanner)
+    read = replace(
+        read,
+        scanner=replace(read.scanner, predicate=q, columns=("a",), limit=5),
+        input_dependencies=[listing],
+    )
+    r = (col("a") < 99) | (col("b") == "x")
+    if shape == "bare":
+        root = listing
+    elif shape == "filter":
+        root = Filter(predicate_expr=r, input_dependencies=[read])
+    elif shape == "count":
+        root = Count(input_dependencies=[read])
+    elif shape == "non_read":
+        root = MapBatches(
+            fn=lambda batch: batch,
+            input_dependencies=[listing],
+            batch_format="pyarrow",
+            can_modify_num_rows=True,
+        )
+    elif shape == "declined_scanner":
+
+        class DecliningScanner(ParquetScanner):
+            def listing_pruning_context(self):
+                raise AssertionError("no context probe on an inactive/unknown source")
+
+        root = replace(read, scanner=DecliningScanner(schema=read.schema))
+    else:
+        root = read
+    derived = _apply(root)
+    cleared = _list_files_of(derived)
+    assert _footer_indexer(cleared.file_indexer)._listing_hint is None
+    assert cleared.file_indexer is not configured
+    assert configured._listing_hint is hint
+    assert original._listing_hint is None
+    assert (
+        _footer_indexer(_list_files_of(_apply(derived.dag)).file_indexer)._listing_hint
+        is None
+    )
+    if shape in ("read", "filter", "count"):
+        assert cleared.predicate is q
+        assert cleared.projected_columns == ["a"]
+        assert cleared.limit == 5
+    if shape == "filter":
+        assert isinstance(derived.dag, Filter)
+        assert derived.dag.predicate_expr is r
+
+
+def test_shared_indexer_and_replaced_root_are_independently_cleaned(tmp_path):
+    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
+        FooterFileIndexer,
+    )
+    from ray.data._internal.logical.operators.count_operator import Count
+    from ray.data._internal.logical.operators.n_ary_operator import Union
+
+    configured = FooterFileIndexer(ignore_missing_paths=False).with_listing_hint(
+        _previous_hint()
+    )
+    read = _mk_read_files(tmp_path)
+    listing = replace(_source_list_files(read), file_indexer=configured)
+    read = replace(read, input_dependencies=[listing])
+    first = _apply(Count(input_dependencies=[read]))
+    second = _apply(Filter(predicate_expr=col("a") > 0, input_dependencies=[read]))
+    assert _footer_indexer(_list_files_of(first).file_indexer)._listing_hint is None
+    assert _footer_indexer(_list_files_of(second).file_indexer)._listing_hint is None
+    assert configured._listing_hint is not None
+    # Include a shared-DAG repeated source and a bare listing with no ReadFiles.
+    result = _apply(Union(input_dependencies=[read, listing, read]))
+    listings = [
+        node for node in result.dag.post_order_iter() if isinstance(node, ListFiles)
+    ]
+    assert listings and all(
+        _footer_indexer(node.file_indexer)._listing_hint is None for node in listings
+    )
+    assert configured._listing_hint is not None
+
+
+@pytest.mark.parametrize("shape", ["bare", "read", "non_read"])
+def test_unknown_indexer_clear_override_is_never_called(tmp_path, shape):
+    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
+        FooterFileIndexer,
+    )
+
+    class CustomIndexer(FooterFileIndexer):
+        def with_listing_hint(self, hint):
+            raise AssertionError("custom hint callback must not be probed")
+
+    indexer = CustomIndexer(ignore_missing_paths=False)
+    read = _mk_read_files(tmp_path)
+    listing = replace(_source_list_files(read), file_indexer=indexer)
+    if shape == "bare":
+        root = listing
+    elif shape == "read":
+        root = replace(read, input_dependencies=[listing])
+    else:
+        root = MapBatches(
+            fn=lambda batch: batch,
+            input_dependencies=[listing],
+            batch_format="pyarrow",
+            can_modify_num_rows=True,
+        )
+    assert _list_files_of(_apply(root)).file_indexer is indexer
 
 
 if __name__ == "__main__":
