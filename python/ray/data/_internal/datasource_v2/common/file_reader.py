@@ -1,6 +1,6 @@
 from enum import Enum
 from functools import cached_property, partial
-from typing import Any, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import pyarrow as pa
 import pyarrow.dataset as pds
@@ -56,6 +56,24 @@ class FileFormat(str, Enum):
     JSON = "json"
     ARROW = "arrow"
     IPC = "ipc"
+
+
+def _resolve_file_dataset_schema(
+    schema: pa.Schema,
+    partition_column_names: Iterable[str],
+    synthesized_column_names: Iterable[str],
+) -> Optional[pa.Schema]:
+    """Strip derived fields after the caller has admitted the schema.
+
+    The reader rejects absent/extension schemas before accessing name properties;
+    listing admission validates its primitive schema before calling this helper.
+    """
+    partition_keys = set(partition_column_names)
+    synthesized = set(synthesized_column_names)
+    fields = [
+        f for f in schema if f.name not in partition_keys and f.name not in synthesized
+    ]
+    return pa.schema(fields) if fields else None
 
 
 @DeveloperAPI
@@ -151,22 +169,23 @@ class FileReader(Reader[FileManifest]):
         match an on-disk column of the same name; stripping it keeps pyarrow
         from attempting that cast.
         """
-        if self._schema is None:
+        schema = self._schema
+        if schema is None:
             return None
-        if any(isinstance(f.type, pa.ExtensionType) for f in self._schema):
+        if any(isinstance(f.type, pa.ExtensionType) for f in schema):
             return None
         partition_keys = (
             set(self._partition_parser._scheme.field_names or [])
             if self._partition_parser is not None
             else set()
         )
-        synthesized = {c.name for c in self._synthesized_columns}
-        fields = [
-            f
-            for f in self._schema
-            if f.name not in partition_keys and f.name not in synthesized
-        ]
-        return pa.schema(fields) if fields else None
+        # Keep the early guards above: name properties must not be touched
+        # when the original reader would have declined the schema pin.
+        return _resolve_file_dataset_schema(
+            schema,
+            partition_keys,
+            (c.name for c in self._synthesized_columns),
+        )
 
     def _broadcast_partition_value(
         self, name: str, value: Any, num_rows: int
