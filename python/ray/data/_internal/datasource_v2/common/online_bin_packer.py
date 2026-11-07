@@ -469,6 +469,11 @@ class OnlineBinPacker(FilePartitioner):
             if item.run is None:
                 files.append(item.file)
                 chunk_metadatas.append(None)
+            elif item.run.schema_only:
+                # Empty-output evidence must not merge with data or duplicate
+                # source entries, even though its unit set is disjoint from all.
+                files.append(item.file)
+                chunk_metadatas.append(item.run.to_metadata())
             else:
                 runs_by_file[item.file].append(item.run)
 
