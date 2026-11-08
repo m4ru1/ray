@@ -112,8 +112,6 @@ I compared final commit `17bbe597` with upstream `aa00fdbb` on the same **59.75 
 
 At 50% retention, query time fell by 55.0–62.6%; at 12.5%, by 94.2–95.9%. Keeping every group gave mixed results: one pair was 5.48% slower and the other 0.42% shorter. Both versions still read data from all 55 files in every case.
 
-A separate 205 KB all-kept control on final `17bbe597` versus `aa00fdbb` was 86.9–335.6 ms slower in all four pairs (median +5.91%); it used a pre-read without clearing caches in a Linux ARM64 container with a 5 GiB memory limit on a Mac, so it is not directly comparable with the cloud timings above.
-
 For the cloud dataset, the three filters are `(p == -1) | (x >= threshold)`, with thresholds 0, 524288 and 917504. Separate checks compared the full output, including every payload byte, schema and duplicate counts, and verified the row groups actually read. Timed runs kept only row-count, schema and null checks. Timing covers query construction through consuming all results, excluding Ray startup and the full-output checks.
 
 These runs used a 16-vCPU, 32 GB Linux x86_64 VM, eight Ray CPUs, a cloud SSD block volume, Python 3.10.12 and PyArrow 23.0.1. Caches were not cleared, and full validation ran before timing. Uncontrolled cache reuse may account for part of the large gain in the 12.5% case. With only two pairs per filter, these results do not establish a stable overhead or predict cold-cache or remote-filesystem performance.
