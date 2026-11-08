@@ -51,21 +51,40 @@ Aarrya, since [#67037](https://github.com/ray-project/ray/pull/67037) also chang
 
 ## Scope and error behavior
 
-The new path is limited to a root `Filter → ReadFiles → ListFiles` query using built-in local Hive Parquet. Sharing substitution code does not establish how another source derives partition values or produces its output schema.
+The new path is limited to a root `Filter → ReadFiles → ListFiles` query using built-in local Hive Parquet. Here, “fallback” means declining the new residual hint; existing pushdowns and the full row filter still run. Support for an expression does not guarantee that its statistics will eliminate a group.
 
-<details>
-<summary>Supported expressions and fallback cases</summary>
+### Expression coverage
 
-- Signed `int8`, `int16`, `int32` and `int64` comparisons, with literals that fit the field width. Column-to-column comparisons must resolve through partition substitution; if two columns remain, the hint is declined.
-- String/bool equality and inequality, leaf null checks, and nested AND/OR/NOT. Every part of the residual expression must be supported.
-- Literal IN lists of 1–256 homogeneous, non-null values, with int64, bool or string input. Narrow-integer IN is not supported.
-- Float64 is allowed as an unreferenced payload column. Floating-point operands, arithmetic and UDFs in the residual expression fall back to the existing path.
-- Remote/custom filesystems, scanner/indexer subclasses and non-Hive partitions fall back. The ordinary retry wrapper around the built-in local filesystem is supported.
-- Unsupported or nested/extension types, schema/field metadata, synthesized columns and custom Parquet format options fall back. Downstream maps, count/limit plans, ordered or shuffled reads, checkpointing and tolerated block errors also use the existing path.
+These restrictions apply to the residual expression used for the new hint, not to an already-pushed data filter. The residual must reference a partition column, and every part of it must be supported.
+
+| Expression | Accepted by the hint | Falls back |
+|---|---|---|
+| Signed-integer comparisons | `==`, `!=`, `<`, `<=`, `>`, `>=` on `int8`/`int16`/`int32`/`int64`; literals must fit the field width | Out-of-range literals, such as comparing an `int8` field with `128` |
+| String/bool comparisons | `==` and `!=` | Ordering comparisons such as `name < "m"` |
+| Boolean composition and null checks | Nested AND/OR/NOT; `is_null` and `is_not_null` on a column or supported literal | An unsupported branch declines the whole hint, even if another branch could simplify to true |
+| Literal IN | 1–256 non-null values of one type, matching an `int64`, bool or string input | Narrow-integer IN, mixed types, nulls, empty lists or lists longer than 256 |
+| Column-to-column comparisons | A type-compatible comparison whose partition operand becomes a typed literal, for example `x < partition_limit` | Two column operands remain after substitution |
+| Floating point, arithmetic and UDFs | `float64` may be an unreferenced payload column | Floating-point operands, arithmetic or UDFs in the residual |
 
 Missing statistics can keep every group, and IN pruning depends on the Arrow version. This does not include [#67943](https://github.com/ray-project/ray/pull/67943)’s derived arithmetic or prefix predicates.
 
-</details>
+### Supporting other data sources
+
+I separated the reusable expression work from the source-specific checks. The common helper takes partition values that have already been converted to the reader’s types, then uses the existing column-substitution visitor. It does not parse paths, read statistics or decide the output schema. The Parquet adapter has to establish three things before using its result:
+
+- **The substituted value must be the value the reader returns.** This adapter uses the reader’s Hive parser and type conversion. Other readers can give the same path a different meaning: [MCAP keeps a message’s own `topic`](https://github.com/m4ru1/ray/blob/17bbe5978dfb326746fca975be4a3abb9277a6b7/python/ray/data/_internal/datasource_v2/formats/mcap/mcap_reader.py#L247-L272), so a message with `topic="lidar"` under `topic=camera/` must not be treated as `topic="camera"`. Parsing the path correctly is not enough to justify that substitution.
+- **The source needs a way to exclude its own read units.** Parquet checks physical field types against the fixed reader schema, then uses footer statistics to select row groups. A physical `INT32` alone is insufficient: it might represent an integer, date or decimal. ORC already shares the Arrow scanner and partition parser, but its current indexer lists whole files and its [reader does not implement native stripe pruning](https://github.com/m4ru1/ray/blob/17bbe5978dfb326746fca975be4a3abb9277a6b7/python/ray/data/_internal/datasource_v2/formats/orc/orc_file_reader.py#L34-L40). Reusing substitution alone would not supply that missing selection step.
+- **Removing every data group must still leave the right schema.** The schema-only consumer is in the common `FileReader`, which ORC also inherits. It uses the normal partition-column insertion and projection, but relies on the producer having checked the layout; only the Parquet path produces those verified entries here. Another reader’s extra fields, conversions or schema evolution need corresponding checks. Keeping a data group solely for its schema would avoid this new agreement, but would also retain an unnecessary read.
+
+For now I enable that combination only for the built-in local Hive Parquet scanner and indexer. Remote filesystems and subclasses are excluded because this PR has not established the same contract for them, not because partition substitution inherently requires local storage. Other indexers can implement `FileIndexer.with_residual_pruning`; its default leaves listing unchanged. An implementation needs to establish its reader contract and add real-reader tests for values, empty schemas and errors.
+
+| Area | Enabled here | Existing path retained |
+|---|---|---|
+| Source | Built-in Hive Parquet on the local filesystem, including its normal retry wrapper | Remote/custom filesystems, non-Hive partitioning and scanner/indexer subclasses |
+| Schema and reader configuration | Matching fixed primitive logical/physical schema and normal projection | Unsupported types, nested/extension types, schema/field metadata, incompatible footer layout, synthesized columns or custom Parquet format options |
+| Query/execution | Root `Filter → ReadFiles → ListFiles`, unordered and unshuffled | Downstream maps, count/limit plans, ordered/shuffled reads, checkpointing or tolerated block errors |
+
+### Error behavior
 
 Required footer reads still happen, and errors on the read path that actually runs propagate normally. Pruned groups are not read or evaluated just to reproduce an error: a corrupt page or a division-by-zero expression confined to those groups may no longer raise.
 
@@ -77,47 +96,16 @@ Thanks, [Jadiouo](https://github.com/ray-project/ray/pull/67855#pullrequestrevie
 
 The original issue’s regression compares the complete `(x, year, month)` multiset in both arms, including duplicate counts, and checks the schema. On PyArrow 17.0.0 and 23.0.1, it returned the same 5,000 fully checked rows while consumption fell from 160 to 25 row groups and from 32 to five data files. Footer reads still happen; these are data-consumption counts, not total opens or bytes.
 
-The focused checks passed **306 tests with one expected failure on each Arrow version**: 229 unit tests, 21 schema-only end-to-end tests, and 56 footer-reader/chunking tests. The expected failure is the known case where partition pruning removes every file before footer listing, so no schema entry reaches the reader. Jadiouo’s original 20-query script has not been rerun as a set.
+The focused unit, real-worker and footer tests passed **306 tests with one expected failure on each Arrow version**. The expected failure is the known case where partition pruning removes every file before footer listing, so no schema entry reaches the reader. Jadiouo’s original 20-query script has not been rerun as a set.
 
-Those runs used `eb672700` plus the final test-only oracle update, Python 3.11.18, matching Ray Core `891a5a89`, and usage statistics disabled. The final integrated commit `17bbe597` has identical changed source/test files; the only difference among the 837 Data files is an unrelated upstream `llm.py` documentation line. The 306-test selection has not been rerun on that integration. Its performance experiment below used matching `aa00fdbb` Core. These are local checks, not a full upstream CI pass.
+The functional runs used the pre-integration revision with matching Ray Core. Its changed source and test files are identical to the final integration; the remaining difference in the checked Data source is an unrelated upstream docstring. The full 306-test selection has not been rerun after that integration. The performance runs below did use the final integrated revision and its matching Core. These local checks are not a full upstream CI pass.
 
-<details>
-<summary>Test commands and source identity</summary>
-
-Both Arrow environments ran these commands from `/workspace`, with `python` referring to `/tmp/check-venv/bin/python`. The harness set `PYTHONPATH=/harness`, `PYTEST_PLUGINS=identity_guard,usage_state`, `PYTHONDONTWRITEBYTECODE=1` and `RAY_USAGE_STATS_ENABLED=0`. The plugins check the loaded source and runtime; copying the pytest lines alone does not reproduce that identity audit.
+The original-issue regression can be run with:
 
 ```bash
-python -m pytest -v -ra -p no:cacheprovider \
-  --basetemp=/out/pytest-original --junitxml=/out/original.xml \
+python -m pytest \
   'python/ray/data/tests/datasource_v2/test_schema_only_manifest.py::test_empty_output_schema_and_actual_reads[original]'
-
-python -m pytest -v -ra -p no:cacheprovider \
-  --basetemp=/out/pytest-unit --junitxml=/out/unit.xml \
-  python/ray/data/tests/unit/datasource_v2/test_listing_pruning_context.py \
-  python/ray/data/tests/unit/datasource_v2/test_listing_integration.py \
-  python/ray/data/tests/unit/datasource_v2/test_schema_only_manifest.py \
-  python/ray/data/tests/unit/datasource_v2/test_file_reader_layout.py \
-  python/ray/data/tests/unit/datasource_v2/test_listing_read_audit.py \
-  python/ray/data/tests/unit/datasource_v2/test_arrow_file_scanner.py \
-  python/ray/data/tests/unit/datasource_v2/test_online_bin_packer.py \
-  python/ray/data/tests/unit/datasource_v2/test_chunk_metadata.py \
-  python/ray/data/tests/unit/datasource_v2/test_derive_list_files_pushdown.py
-
-python -m pytest -v -ra -p no:cacheprovider \
-  --basetemp=/out/pytest-worker --junitxml=/out/worker.xml \
-  python/ray/data/tests/datasource_v2/test_schema_only_manifest.py \
-  python/ray/data/tests/datasource_v2/test_footer_reader.py \
-  python/ray/data/tests/datasource_v2/test_footer_chunking.py -k 'not original'
 ```
-
-The stages returned 1 passed, 229 passed, and 76 passed / 1 xfailed / 1 deselected. The original-issue case was deselected only in the last stage because it ran separately first. The schema-only file accounts for 21 passed / 1 xfailed in total; the other 56 tests in the last stage are footer-related. All stages exited successfully. Black, Ruff, import ordering and Pyrefly passed on the oracle-only update.
-
-- Test-only patch on `eb6727009e5305106f45607cffd549e4ca86e512`: SHA-256 `3a57d79a8d4593146936a828ef5c68a830c870993bb12984fa03017e5995e6bb`.
-- Tested 837-file source manifest: `7337a1424907d06858689c5955814161710b34060d7ff669875edb6a6929bdb7`.
-- Final integration: `17bbe5978dfb326746fca975be4a3abb9277a6b7`, based on upstream `aa00fdbb6c64a358f19e2f523068d612b19874de`.
-- Final integrated 837-file manifest: `958afc6d778eee15f1ef0aa733d5f003bb7320271ca8e26d06a3dff256b0bd6b`.
-
-</details>
 
 ## Performance
 
