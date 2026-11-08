@@ -36,7 +36,7 @@ For the original issue’s query, Arrow 17.0.0 and 23.0.1 both consumed 25 rathe
 
 I moved the planning regressions into the listing rule’s test module, before its main guard. The focused run passed 306 tests on each Arrow version, including 21 schema-only end-to-end tests, with one existing pre-footer empty-input failure marked expected. Those checks ran before the latest upstream integration, with matching Core. The changed files are identical, but the full selection has not been rerun on the integrated revision, and full upstream CI has not run.
 
-I also reran timings on the final integrated commit. In four pairs per case, the 3.735 GB selective query had a median time reduction of 14.10%, while the small all-kept query was slower in every pair, with a median increase of 5.91%. Caches were not cleared and the container reached its memory limit. The description includes all samples and these limits.
+I reran both timings on the final integrated commit. The 3.735 GB selective query was faster, with a median time reduction of 14.10% across four pairs. The small query that kept every row was slower in all four pairs, with a median increase of 5.91%. I have included every pair in the description; these were local runs without clearing the cache, and the container hit its memory limit, so I would not generalize the size of the gain yet.
 
 I have not rerun your exact 20-query set. If you still have the script, could you share it? The cases that fell back in your run would be useful to compare on the same input. Pruning is now in listing; the design question I raised with Aarrya is how the manifest should carry the empty-result schema without retaining a data group just for it.
 
@@ -48,6 +48,6 @@ I have not rerun your exact 20-query set. If you still have the script, could yo
 
 我把计划回归移到了 listing 规则的测试模块中，放在 main guard 之前。两个 Arrow 版本的定向运行各通过 306 项，包括 21 项 schema-only 端到端测试，另有一个已知的 footer 前空输入用例标记为预期失败。这些检查运行于合入最新上游之前，使用匹配 Core。变更文件与整合版相同，但整合后尚未重跑全部定向测试，也未运行上游完整 CI。
 
-我也在最终整合 commit 上重新计时，每个场景四对。3.735 GB 可裁查询的配对降时中位数为 14.10%，小规模全保留查询则四对全部变慢，中位增幅为 5.91%。没有清空缓存，容器也触及内存上限；正文保留了所有样本和这些限制。
+我在最终整合 commit 上把两种查询都重新测了一轮。3.735 GB 选择性查询的四对耗时降幅中位数为 14.10%；保留全部行的小查询则四对全部变慢，增幅中位数为 5.91%。每一对结果都放进了正文。这轮是没有清缓存的本地实验，容器也碰到了内存上限，所以还不能把收益幅度推广到其他场景。
 
 你那组确切的 20 条查询还没有重新运行。如果脚本还在，能分享一下吗？你当时回退的那些情况，值得用同一份输入重新比较。裁剪现在已经移到 listing；我向 Aarrya 提出的设计问题是，manifest 应该怎样携带空结果的 schema，而不必仅为它保留一个数据行组。

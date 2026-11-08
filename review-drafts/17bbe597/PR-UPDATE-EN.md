@@ -109,16 +109,24 @@ python -m pytest \
 
 ## Performance
 
-All timings here are new measurements of final commit `17bbe597` against clean upstream `aa00fdbb`, using matching Core and PyArrow 23.0.1. The selective fixture occupies **3,735,281,660 bytes (3.735 GB)**: 55 Hive-partitioned files, each with 64 groups of 1,024 rows and a 1,024-byte payload per row. The filter `(p == -1) | (x >= 57344)` keeps the final eight groups in each file. The payload is a string of 1,024 ASCII bytes; files use no compression or dictionary encoding, and only `x` has statistics. Separate diagnostics checked the complete content, schema and duplicate counts of all 450,560 output rows, including every payload byte. Consumption fell from 3,520 to 440 groups; both versions still consumed data from all 55 files.
+I reran the comparison on final commit `17bbe597` against clean upstream `aa00fdbb`, with matching Ray Core and PyArrow 23.0.1.
 
-The small all-kept control uses `(year == "2023") | (x >= 0)` and occupies 205,457 bytes in 32 files with five groups each. Both versions consumed all 160 groups and returned the same 32,000 fully checked rows; the candidate’s hint was active.
+On the 3.735 GB selective query, the revision read 440 row groups instead of 3,520 and returned the same 450,560 rows. Across four pairs, query time fell by 8.50–27.25%, with a median reduction of 14.10%. Both versions still read data from all 55 files.
 
-Each case used four pairs, alternating upstream → revision and revision → upstream. The selective query took 8.50–27.25% less time, with a median paired reduction of 14.10% (median upstream/revision ratio 1.168×). The small control was slower in **all four pairs**, by 86.9–335.6 ms or 2.35–9.60%, with a median increase of 5.91%.
+I also checked a small query that keeps every row, so the extra listing work cannot save a read. That query was slower with the revision in **all four pairs**: an extra 86.9–335.6 ms, or 2.35–9.60%, with a median increase of 5.91%.
+
+These were local runs with a pre-read, without clearing the cache. The container reached its 5 GiB memory limit and reclaimed memory, though no OOM or spill was observed. Upstream timings for the selective query varied from 6.779 to 9.061 s, so four pairs are not enough to tell how repeatable the size of the gain is. Cold-storage and remote-filesystem performance remain untested.
 
 <details>
-<summary>All formal timing pairs and measurement conditions</summary>
+<summary>Workloads, all timing pairs and setup</summary>
 
-Selective case:
+The selective dataset has 55 Hive-partitioned files, each with 64 groups of 1,024 rows. Each row carries a 1,024-byte ASCII string; the files are uncompressed, use no dictionary encoding, and have statistics only for `x`. They occupy 3,735,281,660 bytes. The filter `(p == -1) | (x >= 57344)` keeps the last eight groups in each file.
+
+The small control has 32 files, five groups per file and 205,457 bytes in total. Its filter, `(year == "2023") | (x >= 0)`, keeps all 32,000 rows and 160 groups. The revision’s hint is active in this case too.
+
+I alternated the order of the two versions. All four pairs for each query are below.
+
+Selective query:
 
 | Pair order | Upstream | This revision | Query-time change |
 |---|---:|---:|---:|
@@ -136,13 +144,13 @@ Small all-kept control:
 | Upstream → revision | 3.4964 s | 3.8320 s | +335.6 ms (+9.60%) |
 | Revision → upstream | 3.5988 s | 3.7785 s | +179.8 ms (+4.99%) |
 
-The machine was a 32 GiB Mac running Linux ARM64 Docker, Python 3.11.18 and PyArrow 23.0.1. The container had four CPUs and a 5 GiB memory limit. Ray used two CPUs, a 1 GiB object store and a 512 MiB Data soft budget; spilling and usage statistics were disabled, with unordered local-filesystem reads.
+The runs used Linux ARM64 Docker on a 32 GiB Mac, with Python 3.11.18. The container had four CPUs and 5 GiB of memory; Ray used two CPUs, a 1 GiB object store and a 512 MiB Data soft budget. Reads were unordered, with spilling and usage statistics disabled.
 
-Every run used a fresh Ray instance and an ordinary full forward pre-read before Ray startup. The query timer started before Dataset/filter construction and ended after `iter_batches(batch_size=4096, batch_format="pyarrow", prefetch_batches=0)` finished. It included listing, reading, filtering, transfer and row-count/schema/null checks. Startup/shutdown, pre-reading, source hashing and stats extraction were excluded; startup was recorded separately at 2.14–3.42 s. Full payload hashing and read observers ran only in four diagnostic runs before the 16 formal samples. No formal samples failed or were excluded.
+I checked the complete output, including payloads, schema and duplicate counts, and observed row-group reads in four separate runs before timing. Each timing run used a full sequential pre-read followed by a fresh Ray instance. I then timed from building the Dataset/filter until all results had been consumed, using 4,096-row Arrow batches without prefetch. Those timings include the remaining row-count, schema and null checks, but not the pre-read or Ray startup.
+
+The reduction in consumed groups was observed directly. I did not measure the exact bytes or file opens saved, or how much of the pre-read data remained cached during each query.
 
 </details>
-
-Caches were not cleared, and the pre-read does not establish that the fixture stayed in memory. The container reached its 5 GiB limit and experienced memory reclaim, without an OOM or observed spill. Upstream selective timings ranged from 6.779 to 9.061 s. Four pairs under these conditions do not establish a stable regression bound or performance on cold storage or remote filesystems. Total opens and exact I/O bytes were not measured.
 
 This continues #67567’s proposed per-file substitution in the existing PR. It is distinct from #67943’s derived predicates and #67037’s manifest/count changes; their combined behavior has not been tested.
 
