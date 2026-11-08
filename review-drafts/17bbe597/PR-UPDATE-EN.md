@@ -102,18 +102,21 @@ python -m pytest -v -ra -p no:cacheprovider \
 
 ## Performance
 
-Local comparisons used final commit `17bbe597` against clean upstream `aa00fdbb`, matching Ray Core and PyArrow 23.0.1. Each workload had four pairs with alternating run order.
+I compared final commit `17bbe597` with upstream `aa00fdbb` on the same **59.75 GB dataset**, using filters that keep all, half or one eighth of its row groups. Each case has two pairs, with the version order reversed in the second pair. Times below are query seconds, **upstream → this revision**.
 
-| Workload | Data row groups, upstream → revision | Query-time change |
-|---|---:|---|
-| 3.735 GB selective query, same 450,560 output rows | 3,520 → 440 | 8.50–27.25% less query time; median reduction 14.10% |
-| Small query keeping all 32,000 rows | 160 → 160 | Slower in all four pairs: +86.9–335.6 ms (+2.35–9.60%); median +5.91% |
+| Row groups retained | Groups read, upstream → revision | Pair 1 | Pair 2 |
+|---|---:|---:|---:|
+| 100% | 3,520 → 3,520 | 271.308 → 286.169 | 289.937 → 288.712 |
+| 50% | 3,520 → 1,760 | 289.030 → 130.144 | 293.935 → 109.925 |
+| 12.5% | 3,520 → 440 | 269.824 → 15.784 | 233.917 → 9.551 |
 
-The selective filter was `(p == -1) | (x >= 57344)`; it still reads data from all 55 files. The all-kept control used `(year == "2023") | (x >= 0)` and shows the cost when the extra listing work saves no reads.
+At 50% retention, query time fell by 55.0–62.6%; at 12.5%, by 94.2–95.9%. Keeping every group gave mixed results: one pair was 5.48% slower and the other 0.42% shorter. Both versions still read data from all 55 files in every case.
 
-Timing starts after a fresh Ray startup, from query construction through consuming all results. The pre-read is outside the timer; complete output equality was checked in separate runs before timing.
+A separate 205 KB all-kept control on final `17bbe597` versus `aa00fdbb` was 86.9–335.6 ms slower in all four pairs (median +5.91%); it used a pre-read without clearing caches in a Linux ARM64 container with a 5 GiB memory limit on a Mac, so it is not directly comparable with the cloud timings above.
 
-These runs used a sequential pre-read without clearing caches, in a four-CPU Linux ARM64 container with a 5 GiB memory limit. Memory reclaim occurred, though no OOM or spill was observed. Selective-query baseline times varied from 6.779 to 9.061 s, so four pairs are too few to establish the size of the gain reliably. Exact bytes saved, cold-storage performance and remote filesystems were not measured.
+For the cloud dataset, the three filters are `(p == -1) | (x >= threshold)`, with thresholds 0, 524288 and 917504. Separate checks compared the full output, including every payload byte, schema and duplicate counts, and verified the row groups actually read. Timed runs kept only row-count, schema and null checks. Timing covers query construction through consuming all results, excluding Ray startup and the full-output checks.
+
+These runs used a 16-vCPU, 32 GB Linux x86_64 VM, eight Ray CPUs, a cloud SSD block volume, Python 3.10.12 and PyArrow 23.0.1. Caches were not cleared, and full validation ran before timing. Uncontrolled cache reuse may account for part of the large gain in the 12.5% case. With only two pairs per filter, these results do not establish a stable overhead or predict cold-cache or remote-filesystem performance.
 
 ## Related issues
 
