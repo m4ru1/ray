@@ -149,7 +149,6 @@ class FooterReader:
         logical_schema: pa.Schema | None = None,
         *,
         residual_pruning: ResidualPruning | None = None,
-        residual_read_options: pds.ParquetReadOptions | None = None,
     ):
         from ray.data.context import DEFAULT_RETRIED_IO_ERRORS
 
@@ -186,30 +185,21 @@ class FooterReader:
             else None
         )
         self.residual_pruning = residual_pruning
-        self.residual_read_options = residual_read_options
         self._residual_partition_value_parser = None
         if residual_pruning is not None:
             try:
-                partitioning = residual_pruning[1]
-                self._residual_partition_value_parser = (
-                    self._partition_value_parser
-                    if self._partition_value_parser is not None
-                    and partitioning == self.partitioning
-                    else _PartitionValueParser(partitioning)
+                if self._predicate is not None:
+                    # Shared partition facts must not rebind hidden Q fields.
+                    _validate_residual_expression(
+                        self._predicate, residual_pruning[2], references_only=True
+                    )
+                self._residual_partition_value_parser = _PartitionValueParser(
+                    residual_pruning[1]
                 )
             except Exception:
                 # Q's parser initialization above must still raise normally;
                 # only initialization needed exclusively by R is optional.
                 self.residual_pruning = None
-        self._can_bind_residual_partitions = True
-        if self.residual_pruning is not None and self._predicate is not None:
-            try:
-                # Validate Q's grammar once before sharing partition facts.
-                # Native expressions in compute data operands can hide field
-                # references from get_column_references, so cannot share facts.
-                _validate_predicate_references(self._predicate)
-            except Exception:
-                self._can_bind_residual_partitions = False
         filter_expr = self._predicate
         self.pool = ThreadPoolExecutor(max_workers=io_concurrency)
         # Match Arrow's process-wide pools to the actor's IO concurrency so
@@ -432,57 +422,36 @@ class FooterReader:
 
     def _residual_partition_facts(
         self, path: str
-    ) -> tuple[pc.Expression, set[str], set[str]] | None:
-        """Prepare native facts, overwritten names, and successfully bound names."""
+    ) -> tuple[pc.Expression, set[str]] | None:
+        """Bind only path values that the reader actually supplies."""
         parser = self._residual_partition_value_parser
         if self.residual_pruning is None or parser is None:
             return None
         try:
             expr, _, logical_schema, synthesized = self.residual_pruning
             references = set(get_column_references(expr))
-            synthesized_names = {column.name for column in synthesized}
-            values = parser(path)
-            values = {
-                name: value
-                for name, value in values.items()
-                if name in references and name not in synthesized_names
-            }
-            # Only keys actually present in this path are facts. A missing key
-            # can be a physical column at the root, rather than an implicit NULL.
-            # With the same parser, _filter_for_file removes these keys from Q.
-            # With a different parser, do not bind any possible Q reference.
-            blocked = (
-                self.filter_columns
-                if parser is not self._partition_value_parser
-                else set()
-            )
-            if not self._can_bind_residual_partitions:
-                blocked = set(values)
-            # Preserve R's existing fallback on incompatible path conversion,
-            # even when a converted value cannot be bound as a shared fact.
-            partition_table = _partition_table(values, logical_schema)
+            if references & {column.name for column in synthesized}:
+                return None
+            # Missing keys may be physical columns; never infer NULL from absence.
+            values = {k: v for k, v in parser(path).items() if k in references}
+            table = _partition_table(values, logical_schema)
             partition_expression = pds.scalar(True)
-            bound_partition_columns = set()
             for name in values:
-                if name in blocked:
-                    continue
-                scalar = partition_table[name][0]
+                scalar = table[name][0]
                 if (
                     scalar.is_valid
                     and pa.types.is_floating(scalar.type)
                     and math.isnan(scalar.as_py())
                 ):
-                    # NaN == NaN is not a true partition fact. Its overwrite
-                    # also makes same-named physical statistics unusable.
-                    continue
+                    # NaN == NaN cannot be used as a true partition fact.
+                    return None
                 fact = (
                     pds.field(name) == pds.scalar(scalar)
                     if scalar.is_valid
                     else pds.field(name).is_null()
                 )
                 partition_expression = partition_expression & fact
-                bound_partition_columns.add(name)
-            return partition_expression, set(values), bound_partition_columns
+            return partition_expression, set(values)
         except Exception:
             return None
 
@@ -491,7 +460,7 @@ class FooterReader:
         fragment,
         schema: ParquetSchema,
         candidates: Iterable[int],
-        facts: tuple[pc.Expression, set[str], set[str]] | None,
+        facts: tuple[pc.Expression, set[str]] | None,
     ) -> list[int] | None:
         """Additional possible groups, never evidence for ``fully_matched``."""
         if self.residual_pruning is None or facts is None:
@@ -500,19 +469,11 @@ class FooterReader:
         if not candidates:
             return None
         try:
-            expr, _, logical_schema, synthesized = self.residual_pruning
+            expr, _, logical_schema, _ = self.residual_pruning
             references = set(get_column_references(expr))
-            synthesized_names = {column.name for column in synthesized}
-            _, overwritten_columns, bound_partition_columns = facts
             unknown_columns = (
-                (
-                    reader_unknown_columns(
-                        schema, logical_schema, references, self.residual_read_options
-                    )
-                    | overwritten_columns
-                )
-                - bound_partition_columns
-            ) | synthesized_names
+                reader_unknown_columns(schema, logical_schema, references) - facts[1]
+            )
             bound = _validate_residual_expression(expr, logical_schema, unknown_columns)
             bound = _PyArrowExpressionVisitor(preserve_scalar_types=True).visit(bound)
             # Share the already-read metadata, but give R its own statistics
@@ -695,32 +656,9 @@ class FooterReader:
 FooterReaderActor = ray.remote(FooterReader)
 
 
-_COMPARISONS = frozenset(
-    (Operation.EQ, Operation.NE, Operation.LT, Operation.LE, Operation.GT, Operation.GE)
-)
-
-
-def _validate_predicate_references(expr: "Expr"):
-    """Require Q's native fields to be visible to the Ray reference collector."""
-    # Only built-in nodes have the audited collector/lowering correspondence.
-    if type(expr) is ColumnExpr and isinstance(expr.name, str):
-        return
-    if type(expr) is LiteralExpr:
-        # Constants may have any scalar type, but cannot embed native fields.
-        pa.scalar(expr.value)
-    elif type(expr) is AliasExpr:
-        _validate_predicate_references(expr.expr)
-    elif type(expr) is UnaryExpr:
-        _validate_predicate_references(expr.operand)
-    elif type(expr) is BinaryExpr:
-        _validate_predicate_references(expr.left)
-        _validate_predicate_references(expr.right)
-    else:
-        # Compute UDF options/positional operands can hide native field refs.
-        raise ValueError("Opaque native predicate operands")
-
-
-def _validate_residual_expression(expr: "Expr", schema, unknown_columns=frozenset()):
+def _validate_residual_expression(
+    expr: "Expr", schema, unknown_columns=frozenset(), *, references_only=False
+):
     """Use native statistics only for an unchanged, row-local expression.
 
     Unsafe expressions disable this optional hint as a whole. The original
@@ -732,27 +670,15 @@ def _validate_residual_expression(expr: "Expr", schema, unknown_columns=frozense
     def column_type(column):
         if column.name in unknown_columns:
             raise ValueError("Reader changes the column domain")
-        i = schema.get_field_index(column.name)
-        if i < 0:
-            raise ValueError("Unknown column")
-        t = schema.field(i).type
-        if (
-            pa.types.is_nested(t)
-            or pa.types.is_dictionary(t)
-            or isinstance(t, pa.BaseExtensionType)
-        ):
-            raise ValueError("Non-scalar reader domain")
-        return t
+        return schema.field(column.name).type
 
-    def visit(e):
+    def visit(e, negated=False, allow_float=False):
         if isinstance(e, AliasExpr):
-            visit(e.expr)
+            visit(e.expr, negated, allow_float)
         elif isinstance(e, (ColumnExpr, LiteralExpr)):
             t = column_type(e) if isinstance(e, ColumnExpr) else pa.scalar(e.value).type
-            if pa.types.is_floating(t) or pa.types.is_nested(t):
+            if pa.types.is_floating(t) and not allow_float and not references_only:
                 raise ValueError("Unsafe statistics value domain")
-        elif isinstance(e, UnaryExpr) and e.op == Operation.NOT:
-            visit(e.operand)
         elif (
             isinstance(e, UnaryExpr)
             and e.op in (Operation.IS_NULL, Operation.IS_NOT_NULL)
@@ -760,63 +686,44 @@ def _validate_residual_expression(expr: "Expr", schema, unknown_columns=frozense
         ):
             # Nullness does not depend on floating-point comparison semantics.
             column_type(e.operand)
-        elif isinstance(e, BinaryExpr) and e.op in (
-            *_COMPARISONS,
-            Operation.AND,
-            Operation.OR,
-            Operation.ADD,
-            Operation.SUB,
-            Operation.MUL,
-        ):
-            # Let Arrow bind and simplify the unchanged native expression rather
-            # than requiring a column/scalar shape or deriving new bounds.
-            visit(e.left)
-            visit(e.right)
-        elif (
-            isinstance(e, BinaryExpr)
-            and e.op in (Operation.IN, Operation.NOT_IN)
-            and isinstance(e.left, ColumnExpr)
-            and isinstance(e.right, LiteralExpr)
-        ):
-            visit(e.left)
-            if not isinstance(e.right.value, list):
-                raise ValueError("Not a literal value set")
-            values_type = pa.array(e.right.value).type
-            if not pa.types.is_null(values_type) and values_type != column_type(e.left):
-                raise ValueError("Membership changes the scalar domain")
+        elif isinstance(e, UnaryExpr):
+            visit(e.operand, negated or e.op == Operation.NOT)
+        elif isinstance(e, BinaryExpr):
+            # NaNs cannot match positive comparisons. Negation/!= can retain
+            # them despite min/max ignoring them; IN also distinguishes zeros.
+            allow_float = not negated and e.op in (
+                Operation.EQ,
+                Operation.LT,
+                Operation.LE,
+                Operation.GT,
+                Operation.GE,
+            )
+            visit(e.left, negated, allow_float)
+            if e.op not in (Operation.IN, Operation.NOT_IN):
+                visit(e.right, negated, allow_float)
         else:
-            raise ValueError("Unverified statistics expression")
+            # UDFs can depend on the batch, or pass untyped operands straight to
+            # Arrow (e.g. int8.power(2)); neither is equivalent to eager filtering.
+            raise ValueError("Non-row-local or opaque expression")
 
     visit(expr)
     return expr
 
 
-def reader_unknown_columns(
-    parquet_schema, reader_schema, references, read_options=None
-):
-    """Identify incompatible reader domains; schema equality is not sufficient."""
-    physical = (
-        parquet_schema
-        if isinstance(parquet_schema, pa.Schema)
-        else parquet_schema.to_arrow_schema()
-    )
-    logical = physical if reader_schema is None else reader_schema
+def reader_unknown_columns(parquet_schema, reader_schema, references):
+    """Footer bounds must describe the reader's values, not pre-cast values."""
+    physical = parquet_schema.to_arrow_schema()
     result = set()
     for name in references:
-        i, j = physical.get_field_index(name), logical.get_field_index(name)
-        if i < 0:  # Folder-only fields remain usable partition facts.
+        if physical.get_field_index(name) < 0:
+            # Folder-only fields remain usable partition facts.
             continue
-        before, after = (
-            physical.field(i).type,
-            logical.field(j).type if j >= 0 else None,
+        before, after = physical.field(name).type, reader_schema.field(name).type
+        integer_widening = (
+            pa.types.is_integer(before)
+            and pa.types.is_integer(after)
+            and before.bit_width < after.bit_width
         )
-        if before != after or any(
-            isinstance(t, pa.BaseExtensionType) for t in (before, after)
-        ):
+        if before != after and not integer_widening:
             result.add(name)
-    if read_options is not None and read_options.coerce_int96_timestamp_unit != "ns":
-        for i in range(len(parquet_schema)):
-            leaf = parquet_schema.column(i)
-            if leaf.physical_type == "INT96":
-                result.update(_get_prefix_matches(leaf.path, references))
     return frozenset(result)

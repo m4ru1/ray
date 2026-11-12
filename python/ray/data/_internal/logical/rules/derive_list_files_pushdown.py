@@ -85,14 +85,12 @@ class DeriveListFilesPushdown(Rule):
                 return node
             return node._with_new_input_dependencies(new_inputs)
 
-        def clear(node: LogicalOperator) -> LogicalOperator:
+        def configure(node: LogicalOperator) -> LogicalOperator:
+            # Re-derivation must not retain a hint from a removed Filter.
             if isinstance(node, ListFiles):
                 indexer = node.file_indexer.with_residual_pruning()
                 if indexer is not node.file_indexer:
                     return replace(node, file_indexer=indexer)
-            return node
-
-        def configure(node: LogicalOperator) -> LogicalOperator:
             if not isinstance(node, Filter) or node.predicate_expr is None:
                 return node
             read = node.input_dependencies[0]
@@ -121,7 +119,7 @@ class DeriveListFilesPushdown(Rule):
                 [read._with_new_input_dependencies([configured])]
             )
 
-        dag = plan.dag._apply_transform(clear)._apply_transform(transform)
+        dag = plan.dag._apply_transform(transform)
         dag = dag._apply_transform(configure)
 
         return LogicalPlan(dag=dag, context=plan.context)

@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, AbstractSet, Deque, Iterable, Iterator, List, 
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.dataset as pds
 
 import ray
 from ray._common.utils import env_integer
@@ -214,7 +213,6 @@ class FooterFileIndexer(NonSamplingFileIndexer):
             _inflight if _inflight is not None else self._num_actors * 2
         )
         self._residual_pruning: ResidualPruning | None = None
-        self._residual_read_options: pds.ParquetReadOptions | None = None
 
     def with_residual_pruning(
         self, scanner: Scanner | None = None, residual: Expr | None = None
@@ -227,30 +225,18 @@ class FooterFileIndexer(NonSamplingFileIndexer):
             return self
         configured = copy.copy(self)
         configured._residual_pruning = None
-        configured._residual_read_options = None
         if (
             residual is not None
-            and type(scanner) is ParquetScanner
+            and isinstance(scanner, ParquetScanner)
             and scanner.limit is None
             and scanner.partitioning is not None
         ):
-            try:
-                if not residual._is_pyarrow_convertible():
-                    return configured
-                # Match the reader's option parsing, including nested read_options.
-                # The default footer format still owns statistics interpretation.
-                configured._residual_read_options = pds.ParquetFileFormat(
-                    **scanner.parquet_format_kwargs
-                ).read_options
-                configured._residual_pruning = (
-                    residual,
-                    scanner.partitioning,
-                    scanner.schema,
-                    tuple(scanner.synthesized_columns),
-                )
-            except Exception:
-                # An optional hint must not change normal read failures.
-                configured._residual_read_options = None
+            configured._residual_pruning = (
+                residual,
+                scanner.partitioning,
+                scanner.schema,
+                tuple(scanner.synthesized_columns),
+            )
         return configured
 
     def list_files(
@@ -372,7 +358,6 @@ class FooterFileIndexer(NonSamplingFileIndexer):
                 partition_pruner=partition_pruner,
                 logical_schema=self._logical_schema,
                 residual_pruning=self._residual_pruning,
-                residual_read_options=self._residual_read_options,
             )
             for _ in range(self._num_actors)
         ]
