@@ -64,9 +64,15 @@ if TYPE_CHECKING:
     )
     from ray.data.expressions import Expr
 
-ResidualPruning = Tuple[
-    "Expr", Partitioning, pa.Schema, tuple["SynthesizedColumn", ...]
-]
+
+class ResidualPruning(NamedTuple):
+    """Reader context for optional pruning by a retained residual filter."""
+
+    predicate: Expr
+    partitioning: Partitioning
+    schema: pa.Schema
+    synthesized_columns: tuple[SynthesizedColumn, ...]
+
 
 logger = logging.getLogger(__name__)
 
@@ -189,16 +195,21 @@ class FooterReader:
         if residual_pruning is not None:
             try:
                 if self._predicate is not None:
-                    # Shared partition facts must not rebind hidden Q fields.
-                    _validate_residual_expression(
-                        self._predicate, residual_pruning[2], references_only=True
+                    # Shared partition facts must not rebind hidden pushed fields.
+                    _validate_expression_references(
+                        self._predicate, residual_pruning.schema
                     )
                 self._residual_partition_value_parser = _PartitionValueParser(
-                    residual_pruning[1]
+                    residual_pruning.partitioning
                 )
-            except Exception:
+            except Exception as e:
                 # Q's parser initialization above must still raise normally;
                 # only initialization needed exclusively by R is optional.
+                logger.debug(
+                    "Disabling residual pruning during initialization: %s",
+                    e,
+                    exc_info=True,
+                )
                 self.residual_pruning = None
         filter_expr = self._predicate
         self.pool = ThreadPoolExecutor(max_workers=io_concurrency)
@@ -428,13 +439,13 @@ class FooterReader:
         if self.residual_pruning is None or parser is None:
             return None
         try:
-            expr, _, logical_schema, synthesized = self.residual_pruning
-            references = set(get_column_references(expr))
-            if references & {column.name for column in synthesized}:
+            pruning = self.residual_pruning
+            references = set(get_column_references(pruning.predicate))
+            if references & {column.name for column in pruning.synthesized_columns}:
                 return None
             # Missing keys may be physical columns; never infer NULL from absence.
             values = {k: v for k, v in parser(path).items() if k in references}
-            table = _partition_table(values, logical_schema)
+            table = _partition_table(values, pruning.schema)
             partition_expression = pds.scalar(True)
             for name in values:
                 scalar = table[name][0]
@@ -452,7 +463,13 @@ class FooterReader:
                 )
                 partition_expression = partition_expression & fact
             return partition_expression, set(values)
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                "Cannot bind residual partition facts for file %s: %s",
+                path,
+                e,
+                exc_info=True,
+            )
             return None
 
     def _residual_row_groups(
@@ -469,20 +486,32 @@ class FooterReader:
         if not candidates:
             return None
         try:
-            expr, _, logical_schema, _ = self.residual_pruning
-            references = set(get_column_references(expr))
+            pruning = self.residual_pruning
+            _, partition_columns = facts
+            references = set(get_column_references(pruning.predicate))
             unknown_columns = (
-                reader_unknown_columns(schema, logical_schema, references) - facts[1]
+                reader_unknown_columns(schema, pruning.schema, references)
+                - partition_columns
             )
-            bound = _validate_residual_expression(expr, logical_schema, unknown_columns)
-            bound = _PyArrowExpressionVisitor(preserve_scalar_types=True).visit(bound)
+            _validate_residual_expression(
+                pruning.predicate, pruning.schema, unknown_columns
+            )
+            bound = _PyArrowExpressionVisitor(preserve_scalar_types=True).visit(
+                pruning.predicate
+            )
             # Share the already-read metadata, but give R its own statistics
             # cache when binding against the reader's logical schema.
             fragment = fragment.subset(row_group_ids=candidates)
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                "Cannot apply residual statistics pruning for file %s: %s",
+                fragment.path,
+                e,
+                exc_info=True,
+            )
             return None
         return self._try_split_by_row_group(
-            fragment, bound, fragment.path, logical_schema
+            fragment, bound, fragment.path, pruning.schema
         )
 
     def _read_and_chunk(self, file: FileInfo) -> ChunkedFile:
@@ -656,57 +685,74 @@ class FooterReader:
 FooterReaderActor = ray.remote(FooterReader)
 
 
-def _validate_residual_expression(
-    expr: "Expr", schema, unknown_columns=frozenset(), *, references_only=False
-):
-    """Use native statistics only for an unchanged, row-local expression.
+def _expression_leaves(expr: Expr) -> Iterator[tuple[ColumnExpr | LiteralExpr, bool]]:
+    """Yield visible leaves and whether their use permits floating statistics."""
 
-    Unsafe expressions disable this optional hint as a whole. The original
-    pushed predicate and residual Filter still run, so this costs only pruning.
-    In particular, Arrow statistics can lose NaNs for negated comparisons and
-    distinguish signed zeros differently from eager IN evaluation.
-    """
-
-    def column_type(column):
-        if column.name in unknown_columns:
-            raise ValueError("Reader changes the column domain")
-        return schema.field(column.name).type
-
-    def visit(e, negated=False, allow_float=False):
+    def visit(e, under_not=False, allow_float=False):
         if isinstance(e, AliasExpr):
-            visit(e.expr, negated, allow_float)
+            yield from visit(e.expr, under_not, allow_float)
         elif isinstance(e, (ColumnExpr, LiteralExpr)):
-            t = column_type(e) if isinstance(e, ColumnExpr) else pa.scalar(e.value).type
-            if pa.types.is_floating(t) and not allow_float and not references_only:
-                raise ValueError("Unsafe statistics value domain")
+            yield e, allow_float
         elif (
             isinstance(e, UnaryExpr)
             and e.op in (Operation.IS_NULL, Operation.IS_NOT_NULL)
             and isinstance(e.operand, ColumnExpr)
         ):
             # Nullness does not depend on floating-point comparison semantics.
-            column_type(e.operand)
+            yield e.operand, True
         elif isinstance(e, UnaryExpr):
-            visit(e.operand, negated or e.op == Operation.NOT)
+            yield from visit(e.operand, under_not or e.op == Operation.NOT)
         elif isinstance(e, BinaryExpr):
             # NaNs cannot match positive comparisons. Negation/!= can retain
             # them despite min/max ignoring them; IN also distinguishes zeros.
-            allow_float = not negated and e.op in (
+            allow_float = not under_not and e.op in (
                 Operation.EQ,
                 Operation.LT,
                 Operation.LE,
                 Operation.GT,
                 Operation.GE,
             )
-            visit(e.left, negated, allow_float)
+            yield from visit(e.left, under_not, allow_float)
             if e.op not in (Operation.IN, Operation.NOT_IN):
-                visit(e.right, negated, allow_float)
+                yield from visit(e.right, under_not, allow_float)
         else:
             # UDFs can depend on the batch, or pass untyped operands straight to
             # Arrow (e.g. int8.power(2)); neither is equivalent to eager filtering.
             raise ValueError("Non-row-local or opaque expression")
 
-    visit(expr)
+    return visit(expr)
+
+
+def _validate_expression_references(expr: Expr, schema: pa.Schema) -> None:
+    """Require schema-bound columns and literal operands, rejecting opaque calls.
+
+    The pushed predicate needs this check before sharing partition facts, but
+    its existing statistics behavior must not depend on residual-only guards.
+    """
+    for leaf, _ in _expression_leaves(expr):
+        if isinstance(leaf, ColumnExpr):
+            schema.field(leaf.name)
+        else:
+            pa.scalar(leaf.value)
+
+
+def _validate_residual_expression(
+    expr: Expr, schema: pa.Schema, unknown_columns=frozenset()
+) -> Expr:
+    """Use native statistics only for an unchanged, row-local expression.
+
+    Unsafe expressions disable this optional hint as a whole. The original
+    pushed predicate and residual Filter still run, so this costs only pruning.
+    """
+    for leaf, allow_float in _expression_leaves(expr):
+        if isinstance(leaf, ColumnExpr):
+            if leaf.name in unknown_columns:
+                raise ValueError("Reader changes the column domain")
+            dtype = schema.field(leaf.name).type
+        else:
+            dtype = pa.scalar(leaf.value).type
+        if pa.types.is_floating(dtype) and not allow_float:
+            raise ValueError("Unsafe statistics value domain")
     return expr
 
 

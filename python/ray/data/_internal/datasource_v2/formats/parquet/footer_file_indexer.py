@@ -20,6 +20,7 @@ from ray.data._internal.datasource_v2.common.non_sampling_file_indexer import (
 from ray.data._internal.datasource_v2.formats.parquet.footer_reader import (
     ChunkedFile,
     FooterReaderActor,
+    ResidualPruning,
 )
 from ray.data._internal.datasource_v2.interfaces.file_manifest import (
     FILE_CHUNK_METADATA_COLUMN_NAME,
@@ -34,7 +35,6 @@ if TYPE_CHECKING:
     from ray.actor import ActorProxy
     from ray.data._internal.datasource_v2.formats.parquet.footer_reader import (
         FooterReader,
-        ResidualPruning,
     )
     from ray.data._internal.datasource_v2.interfaces.file_indexer import FileInfo
     from ray.data._internal.datasource_v2.interfaces.file_pruner import FilePruner
@@ -231,11 +231,11 @@ class FooterFileIndexer(NonSamplingFileIndexer):
             and scanner.limit is None
             and scanner.partitioning is not None
         ):
-            configured._residual_pruning = (
-                residual,
-                scanner.partitioning,
-                scanner.schema,
-                tuple(scanner.synthesized_columns),
+            configured._residual_pruning = ResidualPruning(
+                predicate=residual,
+                partitioning=scanner.partitioning,
+                schema=scanner.schema,
+                synthesized_columns=tuple(scanner.synthesized_columns),
             )
         return configured
 

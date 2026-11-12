@@ -49,7 +49,8 @@ def scanned_groups(tmp_path, monkeypatch):
         runtime_env={"worker_process_setup_hook": install_observer},
     )
     context = DataContext.get_current()
-    previous, context.use_datasource_v2 = context.use_datasource_v2, True
+    previous = context.use_datasource_v2
+    context.use_datasource_v2 = True
 
     def recorded():
         groups = []
@@ -69,7 +70,8 @@ def scanned_groups(tmp_path, monkeypatch):
         ray.shutdown()
 
 
-def compare(query, expected, monkeypatch, scanned_groups):
+def _compare_pruning_modes(query, expected, monkeypatch, scanned_groups):
+    """Run with and without the hint, checking rows before comparing worker scans."""
     actual = query()
     enabled = scanned_groups()
     configure = FooterFileIndexer.with_residual_pruning
@@ -86,40 +88,13 @@ def compare(query, expected, monkeypatch, scanned_groups):
     return len(enabled), len(disabled)
 
 
-@pytest.mark.parametrize(
-    "mode,predicate,groups",
-    [
-        ("direct", (col("p") == "a") | (col("x") >= 25), 6),
-        ("map", (col("p") == "a") | (col("x") >= 25), 6),
-        ("count", (col("p") == "a") | (col("x") >= 25), 6),
-        ("pushed", (col("p") == "a") | (col("x") >= 25), 6),
-        ("fsspec", (col("p") == "a") | (col("x") >= 25), 6),
-        ("s3", (col("p") == "a") | (col("x") >= 25), 6),
-        ("null", col("p").is_null() | (col("x") >= 25), 6),
-        ("missing", (col("p") == "b") | (col("x") >= 25), 6),
-        ("not", ~((col("p") == "a") & (col("x") < 25)), 6),
-        ("in", col("p").is_in(["a"]) | col("x").is_in([5, 35]), 6),
-        ("empty", (col("p") == "absent") | (col("x") < 0), 0),
-        (
-            "arithmetic",
-            ((col("p") == "a") & (col("x") + 100 >= 125))
-            | ((col("p") == "b") & (col("x") < 0)),
-            4,
-        ),
-        ("udf", (col("p") == "a") | (col("x") >= 25), 8),
-        ("path", (col("p") == "a") | col("path").is_not_null(), 8),
-    ],
-)
-def test_rows_and_worker_groups(
-    tmp_path, monkeypatch, scanned_groups, request, mode, predicate, groups
-):
+@pytest.fixture
+def partitioned_data(tmp_path):
+    """Two partitions with four groups each; directory values override stored p."""
     root = tmp_path / "data"
-    all_rows = []
+    tables = []
     for i, p in enumerate(("a", "b")):
-        folder = "p=__NULL__" if mode == "null" and i else f"p={p}"
-        if mode == "missing" and i:
-            folder = "unkeyed"
-        path = root / folder / "data.parquet"
+        path = root / f"p={p}" / "data.parquet"
         path.parent.mkdir(parents=True)
         table = pa.table(
             {
@@ -131,34 +106,147 @@ def test_rows_and_worker_groups(
                 "time": pa.array([None, 123456789] * 20, pa.timestamp("us")),
             }
         )
-        if mode == "path":
-            table = table.append_column("path", pa.nulls(40, pa.string()))
         pq.write_table(table, path, row_group_size=10)
-        for row in table.to_pylist():
-            row["p"] = None if mode == "null" and i else p
-            if mode == "udf":
-                row["x"] += 100
-            if mode == "path":
-                row["path"] = str(path)
-            all_rows.append(row)
+        tables.append(table.set_column(2, "p", pa.array([p] * 40)))
+    return root, pa.concat_tables(tables)
+
+
+def _read_partitioned(root, schema, filesystem=None, **kwargs):
+    return ray.data.read_parquet(
+        str(root),
+        schema=schema,
+        filesystem=filesystem,
+        partitioning=Partitioning(
+            PartitionStyle.HIVE,
+            base_dir=str(root),
+            field_names=["p"],
+            filesystem=filesystem,
+            null_fallback="__NULL__",
+        ),
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    "predicate,groups",
+    [
+        ((col("p") == "a") | (col("x") >= 25), 6),
+        (~((col("p") == "a") & (col("x") < 25)), 6),
+        (col("p").is_in(["a"]) | col("x").is_in([5, 35]), 6),
+        ((col("p") == "absent") | (col("x") < 0), 0),
+        (
+            ((col("p") == "a") & (col("x") + 100 >= 125))
+            | ((col("p") == "b") & (col("x") < 0)),
+            4,
+        ),
+    ],
+    ids=["mixed_or", "not", "in", "empty", "arithmetic"],
+)
+def test_mixed_predicates(
+    partitioned_data, monkeypatch, scanned_groups, predicate, groups
+):
+    root, table = partitioned_data
+    expected = ArrowBlockAccessor(table).filter(predicate).to_pylist()
+
+    def query():
+        return sorted(
+            _read_partitioned(root, table.schema).filter(expr=predicate).take_all(),
+            key=lambda row: row["id"],
+        )
+
+    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
+        groups,
+        8,
+    )
+
+
+@pytest.mark.parametrize("consumer", ["map", "count"])
+def test_downstream_operators(partitioned_data, monkeypatch, scanned_groups, consumer):
+    root, table = partitioned_data
+    predicate = (col("p") == "a") | (col("x") >= 25)
+    expected = ArrowBlockAccessor(table).filter(predicate).to_pylist()
+    if consumer == "count":
+        expected = len(expected)
+
+    def query():
+        ds = _read_partitioned(root, table.schema).filter(expr=predicate)
+        if consumer == "count":
+            return ds.count()
+        ds = ds.map_batches(lambda batch: batch, batch_format="pyarrow")
+        return sorted(ds.take_all(), key=lambda row: row["id"])
+
+    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
+        6,
+        8,
+    )
+
+
+@pytest.mark.parametrize("filesystem_kind", ["native", "fsspec", "s3"])
+def test_pushed_predicate_with_filesystems(
+    partitioned_data, monkeypatch, scanned_groups, request, filesystem_kind
+):
+    root, table = partitioned_data
 
     filesystem = None
-    if mode == "fsspec":
+    if filesystem_kind == "fsspec":
         from fsspec.implementations.local import LocalFileSystem
 
         filesystem = LocalFileSystem(skip_instance_cache=True)
-    elif mode == "s3":
+    elif filesystem_kind == "s3":
         filesystem = request.getfixturevalue("s3_fs")
         destination = request.getfixturevalue("s3_path").removeprefix("s3://")
         pafs.copy_files(str(root), destination, destination_filesystem=filesystem)
         root = destination
 
-    # Evaluate on all input rows before any metadata pruning.
-    oracle = pa.Table.from_pylist(all_rows)
-    if mode in ("pushed", "fsspec", "s3"):
-        oracle = oracle.filter(pc.greater_equal(oracle["x"], 5))
+    predicate = (col("p") == "a") | (col("x") >= 25)
+    oracle = table.filter(pc.greater_equal(table["x"], 5))
     expected = ArrowBlockAccessor(oracle).filter(predicate).to_pylist()
-    expected.sort(key=lambda row: row["id"])
+
+    def query():
+        ds = _read_partitioned(root, table.schema, filesystem=filesystem)
+        ds = ds.filter(expr=col("x") >= 5).filter(expr=predicate)
+        return sorted(ds.take_all(), key=lambda row: row["id"])
+
+    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
+        6,
+        8,
+    )
+
+
+@pytest.mark.parametrize(
+    "directory,partition_value,predicate",
+    [
+        ("p=__NULL__", None, col("p").is_null() | (col("x") >= 25)),
+        ("unkeyed", "b", (col("p") == "b") | (col("x") >= 25)),
+    ],
+    ids=["null_partition", "missing_key_uses_physical_column"],
+)
+def test_partition_values(
+    partitioned_data, monkeypatch, scanned_groups, directory, partition_value, predicate
+):
+    root, table = partitioned_data
+    (root / "p=b").rename(root / directory)
+    oracle = table.set_column(2, "p", pa.array(["a"] * 40 + [partition_value] * 40))
+    expected = ArrowBlockAccessor(oracle).filter(predicate).to_pylist()
+
+    def query():
+        return sorted(
+            _read_partitioned(root, table.schema).filter(expr=predicate).take_all(),
+            key=lambda row: row["id"],
+        )
+
+    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
+        6,
+        8,
+    )
+
+
+def test_block_udf_disables_pruning(partitioned_data, monkeypatch, scanned_groups):
+    root, table = partitioned_data
+    predicate = (col("p") == "a") | (col("x") >= 25)
+    expected = table.to_pylist()
+    for row in expected:
+        row["x"] += 100
 
     def transform(table):
         return table.set_column(
@@ -166,37 +254,43 @@ def test_rows_and_worker_groups(
         )
 
     def query():
-        ds = ray.data.read_parquet(
-            str(root),
-            schema=table.schema,
-            filesystem=filesystem,
-            partitioning=Partitioning(
-                PartitionStyle.HIVE,
-                base_dir=str(root),
-                field_names=["p"],
-                filesystem=filesystem,
-                null_fallback="__NULL__",
-            ),
-            include_paths=mode == "path",
-            _block_udf=transform if mode == "udf" else None,
-        )
-        if mode in ("pushed", "fsspec", "s3"):
-            ds = ds.filter(expr=col("x") >= 5)
-        ds = ds.filter(expr=predicate)
-        if mode == "map":
-            ds = ds.map_batches(lambda batch: batch, batch_format="pyarrow")
-        return (
-            ds.count()
-            if mode == "count"
-            else sorted(ds.take_all(), key=lambda row: row["id"])
+        ds = _read_partitioned(root, table.schema, _block_udf=transform)
+        return sorted(ds.filter(expr=predicate).take_all(), key=lambda row: row["id"])
+
+    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
+        8,
+        8,
+    )
+
+
+def test_synthesized_path_disables_pruning(
+    partitioned_data, monkeypatch, scanned_groups
+):
+    root, table = partitioned_data
+    schema = table.schema.append(pa.field("path", pa.string()))
+    # Physical NULLs cannot describe the non-null paths supplied by the reader.
+    for path in root.glob("*/data.parquet"):
+        physical = pq.ParquetFile(path).read()
+        physical = physical.append_column("path", pa.nulls(40, pa.string()))
+        pq.write_table(physical, path, row_group_size=10)
+    expected = [
+        {**row, "path": str(root / f"p={row['p']}" / "data.parquet")}
+        for row in table.to_pylist()
+    ]
+    predicate = (col("p") == "a") | col("path").is_not_null()
+
+    def query():
+        return sorted(
+            _read_partitioned(root, schema, include_paths=True)
+            .filter(expr=predicate)
+            .take_all(),
+            key=lambda row: row["id"],
         )
 
-    assert compare(
-        query,
-        len(expected) if mode == "count" else expected,
-        monkeypatch,
-        scanned_groups,
-    ) == (groups, 8)
+    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
+        8,
+        8,
+    )
 
 
 @pytest.mark.parametrize(
@@ -304,7 +398,7 @@ def test_reader_value_semantics(
             .take_all()
         )
 
-    enabled, disabled = compare(
+    enabled, disabled = _compare_pruning_modes(
         query, canonical([expected[i] for i in ids]), monkeypatch, scanned_groups
     )
     assert enabled == groups
