@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from functools import cached_property
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -43,25 +43,7 @@ class FileChunk:
     unit_sizes: Tuple[int, ...] = ()
     unit_rows: Tuple[int, ...] = ()
 
-    # A schema-only entry requests an empty block from its source-scoped reader;
-    # it does not carry a schema and must not be reused with another reader.
-    # The real source path determines partition layout, never a sentinel file.
-    schema_only: bool = field(default=False, kw_only=True)
-
     def __post_init__(self):
-        if type(self.schema_only) is not bool:
-            raise ValueError("schema_only must be a boolean")
-        if self.schema_only and (
-            self.unit_ids
-            or self.num_rows != 0
-            or self.size_bytes != 0
-            or self.fully_matched
-            or self.unit_sizes
-            or self.unit_rows
-        ):
-            raise ValueError(
-                "Schema-only entries cannot carry data units or row counts"
-            )
         for name in ("unit_sizes", "unit_rows"):
             breakdown = getattr(self, name)
             assert not breakdown or len(breakdown) == len(self.unit_ids), (
@@ -75,13 +57,7 @@ class FileChunk:
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, Any]) -> "FileChunk":
         # Values come back from the manifest block as lists and numpy scalars.
-        schema_only = metadata.get("schema_only", False)
-        if schema_only is None:
-            schema_only = False  # Legacy rows in a mixed Arrow struct column.
-        if not isinstance(schema_only, (bool, np.bool_)):
-            raise ValueError("Invalid schema-only manifest flag")
         return cls(
-            schema_only=bool(schema_only),
             unit_ids=tuple(metadata["unit_ids"]),
             num_rows=int(metadata["num_rows"]),
             size_bytes=int(metadata["size_bytes"]),
@@ -95,6 +71,14 @@ class FileChunk:
 PATH_COLUMN_NAME = "__path"
 FILE_SIZE_COLUMN_NAME = "__file_size"
 FILE_CHUNK_METADATA_COLUMN_NAME = "__file_chunk_metadata"
+
+# The columns every manifest carries. A source may add its own beyond these;
+# see :meth:`FileManifest.extra_columns`.
+REQUIRED_COLUMN_NAMES = (
+    PATH_COLUMN_NAME,
+    FILE_SIZE_COLUMN_NAME,
+    FILE_CHUNK_METADATA_COLUMN_NAME,
+)
 
 
 class FileManifest:
@@ -112,9 +96,7 @@ class FileManifest:
     narrows it to a run of read units. For unchunked files (whole-file reads),
     the chunk-metadata entry is ``None`` and ``file_sizes`` equals the on-disk
     file size. For chunked files, multiple rows can share the same path but
-    carry different chunk metadata while retaining the on-disk file size.
-    A schema-only row also retains that size; its zero ``FileChunk.size_bytes``
-    is the read budget. The paired reader supplies the certified output layout.
+    carry different chunk metadata.
     """
 
     def __init__(self, block: Block):
@@ -168,6 +150,38 @@ class FileManifest:
     @cached_property
     def file_chunk_metadatas(self) -> np.ndarray:
         return BlockColumnAccessor.for_column(self._file_chunk_metadatas).to_numpy()
+
+    @cached_property
+    def extra_columns(self) -> Optional[pa.Table]:
+        """The source's own columns, beside the three required ones.
+
+        The manifest is the only thing the framework carries from listing to
+        reading, so a source that finds its own data puts what the reader
+        needs here -- for Iceberg, each file's delete files, partition values
+        and record count.
+
+        Only ``OnlineBinPacker`` carries them to the read tasks;
+        ``RoundRobinPartitioner`` rejects a manifest that has them. A new
+        partitioner that rebuilds its output rows instead of slicing its
+        input must pass them to :meth:`construct_manifest`, or that state
+        never reaches the reader.
+
+        Build them with one explicit schema for every manifest a source
+        lists. A packer merges rows from several manifests, and a type
+        inferred from values can be null in one manifest and typed in the
+        next.
+
+        Returns:
+            One row per manifest row, or ``None`` when the manifest carries
+            only the required columns -- every plain file format.
+        """
+        table = BlockAccessor.for_block(self._block).to_arrow()
+        names = [
+            name for name in table.column_names if name not in REQUIRED_COLUMN_NAMES
+        ]
+        if not names:
+            return None
+        return table.select(names)
 
     def as_block(self) -> Block:
         """Return the underlying block for the `FileManifest`.
@@ -232,7 +246,21 @@ class FileManifest:
         paths: List[str],
         sizes: List[int],
         chunk_metadatas: List[Optional[ChunkMetadata]],
+        extra_columns: Optional[pa.Table] = None,
     ) -> "FileManifest":
+        """Build a manifest from the required columns, plus any source columns.
+
+        Args:
+            paths: One file path per row.
+            sizes: On-disk size of each row's file, aligned with ``paths``.
+            chunk_metadatas: Per-row chunk metadata, ``None`` for a whole file.
+            extra_columns: The source's own columns (see
+                :attr:`extra_columns`), one row each, in the same row order.
+                Appended as-is, so their Arrow types survive the round trip.
+
+        Returns:
+            A manifest whose rows are ``paths`` in the order given.
+        """
         assert len(paths) == len(sizes) == len(chunk_metadatas)
 
         block = pa.table(
@@ -242,4 +270,10 @@ class FileManifest:
                 FILE_CHUNK_METADATA_COLUMN_NAME: chunk_metadatas,
             }
         )
+        if extra_columns is not None:
+            assert extra_columns.num_rows == len(
+                paths
+            ), f"{extra_columns.num_rows} extra-column rows for {len(paths)} paths"
+            for field in extra_columns.schema:
+                block = block.append_column(field, extra_columns[field.name])
         return cls(block)

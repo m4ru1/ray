@@ -7,9 +7,13 @@ from typing import TYPE_CHECKING, AbstractSet, Deque, Iterable, Iterator, List, 
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.dataset as pds
 
 import ray
 from ray._common.utils import env_integer
+from ray.data._internal.datasource_v2.common.file_pruners import (
+    PartitionPredicatePruner,
+)
 from ray.data._internal.datasource_v2.common.non_sampling_file_indexer import (
     NonSamplingFileIndexer,
     _shuffle_file_infos,
@@ -31,15 +35,14 @@ if TYPE_CHECKING:
     from ray.actor import ActorProxy
     from ray.data._internal.datasource_v2.formats.parquet.footer_reader import (
         FooterReader,
-    )
-    from ray.data._internal.datasource_v2.formats.parquet.listing_pruning import (
-        ListingPruningHint,
+        ResidualPruning,
     )
     from ray.data._internal.datasource_v2.interfaces.file_indexer import FileInfo
     from ray.data._internal.datasource_v2.interfaces.file_pruner import FilePruner
     from ray.data._internal.datasource_v2.interfaces.scanner import Scanner
     from ray.data.block import BlockColumn
     from ray.data.datasource.file_based_datasource import FileShuffleConfig
+    from ray.data.datasource.partitioning import Partitioning
     from ray.data.expressions import Expr
 
 logger = logging.getLogger(__name__)
@@ -81,25 +84,6 @@ def _chunked_file_to_manifest(chunked_file: ChunkedFile) -> FileManifest:
         paths=[chunked_file.file.path] * n,
         sizes=[chunked_file.file.size] * n,
         chunk_metadatas=[run.to_metadata() for run in chunked_file.row_groups],
-    )
-
-
-def _schema_only_manifest(file: FileInfo) -> FileManifest:
-    """Request an empty block from the paired reader without reading this file."""
-    from ray.data._internal.datasource_v2.interfaces.file_manifest import FileChunk
-
-    assert file.size is not None
-    marker = FileChunk(
-        unit_ids=(),
-        num_rows=0,
-        size_bytes=0,
-        fully_matched=False,
-        schema_only=True,
-    )
-    return FileManifest.construct_manifest(
-        paths=[file.path],
-        sizes=[file.size],
-        chunk_metadatas=[marker.to_metadata()],
     )
 
 
@@ -174,6 +158,8 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         footer_batch_size: Optional[int] = None,
         result_batch_size: Optional[int] = None,
         max_inflight_batches: Optional[int] = None,
+        partitioning: Optional[Partitioning] = None,
+        logical_schema: Optional[pa.Schema] = None,
     ):
         super().__init__(
             ignore_missing_paths=ignore_missing_paths,
@@ -181,8 +167,9 @@ class FooterFileIndexer(NonSamplingFileIndexer):
             num_workers=num_workers,
             max_paths_per_output=max_paths_per_output,
         )
-        self._listing_hint: Optional[ListingPruningHint] = None
         self._coalesce_bytes = coalesce_bytes
+        self._partitioning = partitioning
+        self._logical_schema = logical_schema
         # Coalesce target used instead of ``coalesce_bytes`` (when larger) for a
         # row-group shuffle, so the shuffle unit is a ~chunk-sized run rather
         # than a single, possibly tiny, row group.
@@ -226,46 +213,44 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         self._max_inflight_batches = (
             _inflight if _inflight is not None else self._num_actors * 2
         )
-
-    def without_residual_pruning(self) -> "FooterFileIndexer":
-        if type(self) is not FooterFileIndexer:
-            return self
-        return self.with_listing_hint(None)
+        self._residual_pruning: ResidualPruning | None = None
+        self._residual_read_options: pds.ParquetReadOptions | None = None
 
     def with_residual_pruning(
-        self, scanner: "Scanner", residual: "Expr"
-    ) -> "FooterFileIndexer":
-        from ray.data._internal.datasource_v2.formats.parquet.listing_pruning import (
-            ListingPruningHint,
-        )
+        self, scanner: Scanner | None = None, residual: Expr | None = None
+    ) -> FooterFileIndexer:
         from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
             ParquetScanner,
         )
 
-        # The adapter owns the scanner/indexer pairing and format-specific
-        # admission. A subclass must explicitly establish its own semantics.
-        if (
-            type(self) is not FooterFileIndexer
-            or type(scanner) is not ParquetScanner
-            or scanner.limit is not None
-        ):
-            return self
-        context = scanner.listing_pruning_context()
-        if context is None:
-            return self
-        hint = ListingPruningHint.from_residual(context, residual)
-        return self.with_listing_hint(hint) if hint is not None else self
-
-    def with_listing_hint(
-        self, hint: Optional["ListingPruningHint"]
-    ) -> "FooterFileIndexer":
-        # A subclass must make its own explicit semantic admission decision.
-        if type(self) is not FooterFileIndexer:
-            return self
-        if self._listing_hint is hint:
+        if residual is None and self._residual_pruning is None:
             return self
         configured = copy.copy(self)
-        configured._listing_hint = hint
+        configured._residual_pruning = None
+        configured._residual_read_options = None
+        if (
+            residual is not None
+            and type(scanner) is ParquetScanner
+            and scanner.limit is None
+            and scanner.partitioning is not None
+        ):
+            try:
+                if not residual._is_pyarrow_convertible():
+                    return configured
+                # Match the reader's option parsing, including nested read_options.
+                # The default footer format still owns statistics interpretation.
+                configured._residual_read_options = pds.ParquetFileFormat(
+                    **scanner.parquet_format_kwargs
+                ).read_options
+                configured._residual_pruning = (
+                    residual,
+                    scanner.partitioning,
+                    scanner.schema,
+                    tuple(scanner.synthesized_columns),
+                )
+            except Exception:
+                # An optional hint must not change normal read failures.
+                configured._residual_read_options = None
         return configured
 
     def list_files(
@@ -296,6 +281,7 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         yield from self._process_file_infos(
             file_infos,
             filesystem=filesystem,
+            pruners=pruners,
             preserve_order=preserve_order,
             predicate=predicate,
             limit=limit,
@@ -310,6 +296,7 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         file_infos: Iterable[FileInfo],
         *,
         filesystem: Optional["FileSystem"],
+        pruners: Optional[List["FilePruner"]] = None,
         preserve_order: bool = False,
         predicate: Optional["Expr"] = None,
         limit: Optional[int] = None,
@@ -318,6 +305,12 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         execution_idx: int = 0,
         excluded_read_unit_ids: Optional[AbstractSet[str]] = None,
     ) -> Iterable[FileManifest]:
+        if pruners:
+            file_infos = (
+                info
+                for info in file_infos
+                if all(pruner.should_include(info.path) for pruner in pruners)
+            )
         if excluded_read_unit_ids:
             file_infos = (
                 info for info in file_infos if info.path not in excluded_read_unit_ids
@@ -329,6 +322,7 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         yield from self._process_file_infos(
             file_infos,
             filesystem=filesystem,
+            pruners=pruners,
             preserve_order=preserve_order,
             predicate=predicate,
             limit=limit,
@@ -343,6 +337,7 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         file_infos: Iterable[FileInfo],
         *,
         filesystem: Optional["FileSystem"],
+        pruners: Optional[List["FilePruner"]],
         preserve_order: bool,
         predicate: Optional["Expr"],
         limit: Optional[int],
@@ -351,6 +346,14 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         execution_idx: int,
         excluded_read_unit_ids: Optional[AbstractSet[str]],
     ) -> Iterator[FileManifest]:
+        partition_pruner = next(
+            (
+                pruner
+                for pruner in pruners or []
+                if isinstance(pruner, PartitionPredicatePruner)
+            ),
+            None,
+        )
         shuffle_row_groups = (
             shuffle_config is not None and shuffle_config.small_chunks_shuffle
         )
@@ -365,14 +368,11 @@ class FooterFileIndexer(NonSamplingFileIndexer):
                 projected_columns,
                 coalesce_bytes,
                 excluded_read_unit_ids=excluded_read_unit_ids,
-                listing_hint=(
-                    self._listing_hint
-                    if not preserve_order
-                    and limit is None
-                    and shuffle_config is None
-                    and not excluded_read_unit_ids
-                    else None
-                ),
+                partitioning=self._partitioning,
+                partition_pruner=partition_pruner,
+                logical_schema=self._logical_schema,
+                residual_pruning=self._residual_pruning,
+                residual_read_options=self._residual_read_options,
             )
             for _ in range(self._num_actors)
         ]
@@ -415,9 +415,6 @@ class FooterFileIndexer(NonSamplingFileIndexer):
         pending: Deque[ray.ObjectRefGenerator] = deque()
         batch_no = 0
         delivered_fully_matched_rows = 0
-        # One control entry per shard, not one per excluded file. Each footer
-        # still runs and must certify the same pinned output layout first.
-        empty_layout = None
 
         def dispatch_next() -> bool:
             nonlocal batch_no
@@ -446,17 +443,7 @@ class FooterFileIndexer(NonSamplingFileIndexer):
             gen = pending.popleft()
             for ref in gen:  # blocks until this generator's next result lands
                 for chunked_file in ray.get(ref):
-                    if chunked_file.schema_only_layout is not None:
-                        if empty_layout is not None:
-                            if empty_layout != chunked_file.schema_only_layout:
-                                raise ValueError(
-                                    "Conflicting schema-only layouts in one listing shard"
-                                )
-                        else:
-                            empty_layout = chunked_file.schema_only_layout
-                            yield _schema_only_manifest(chunked_file.file)
-                    if chunked_file.row_groups:
-                        yield _chunked_file_to_manifest(chunked_file)
+                    yield _chunked_file_to_manifest(chunked_file)
                     if limit is not None:
                         # Count only fully-matched (exact-survivor) rows so
                         # stopping can never under-deliver under a filter.

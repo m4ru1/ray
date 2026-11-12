@@ -46,42 +46,12 @@ class FileIndexer(ABC):
         """
         return None
 
-    def without_residual_pruning(self) -> "FileIndexer":
-        """Return an equivalent indexer without a previous residual pruning hint.
-
-        The optimizer calls this before checking whether a new residual Filter
-        can support an optional listing optimization. Implementations that store
-        such hints must clear them without mutating shared configuration, even
-        when the new plan no longer has a reader or residual Filter.
-
-        The default returns this indexer unchanged because it carries no hint.
-        """
-        return self
-
     def with_residual_pruning(
-        self, scanner: "Scanner", residual: "Expr"
+        self, scanner: Optional["Scanner"] = None, residual: Optional["Expr"] = None
     ) -> "FileIndexer":
-        """Optionally narrow listing using a Filter that remains above the read.
+        """Configure optional metadata pruning without removing the residual filter.
 
-        This is an advisory optimization, not accepted filter pushdown: the
-        complete residual Filter and existing reader filters must remain active.
-        The implementation owns compatibility with the supplied scanner and
-        must account for its read semantics, including limits. Unsupported or
-        uncertain configurations must return this indexer unchanged. A hint must
-        not be used as an exact metadata count or hide required listing errors.
-
-        The optimizer clears previous hints before calling this method.
-        A capable implementation returns a configured copy, never mutates shared
-        state, and implements :meth:`without_residual_pruning` to clear its hint.
-        Inheriting a format implementation does not establish that a subclass
-        has the same reader or listing semantics; it must explicitly opt in.
-
-        Args:
-            scanner: The scanner consuming this listing after all pushdowns.
-            residual: The complete Filter expression retained above that read.
-
-        Returns:
-            An independently configured indexer, or this indexer if declined.
+        The default does nothing. Passing no residual clears a previous hint.
         """
         return self
 
@@ -166,6 +136,7 @@ class FileIndexer(ABC):
         file_infos: Iterable["FileInfo"],
         *,
         filesystem: Optional["FileSystem"],
+        pruners: Optional[List[FilePruner]] = None,
         preserve_order: bool = False,
         predicate: Optional["Expr"] = None,
         limit: Optional[int] = None,
@@ -179,7 +150,9 @@ class FileIndexer(ABC):
         File-based indexers can implement this to reuse one planning-time
         listing during execution. The input keeps discovery order; a file shuffle
         may reorder it, while ``preserve_order`` governs metadata result order.
-        Metadata-backed indexers need not support it.
+        ``pruners`` are execution-time filters derived after discovery, not the
+        initial user filters. Metadata-backed indexers also use them to prove
+        which rows survive before stopping under a limit.
         """
         raise NotImplementedError(
             f"{type(self).__name__} cannot process prelisted file infos"

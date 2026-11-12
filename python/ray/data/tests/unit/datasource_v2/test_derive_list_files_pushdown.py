@@ -8,14 +8,9 @@ with no error. These tests pin that invariant, including for plan shapes no
 current rule produces but a future one could.
 """
 
-import ast
-import copy
-import inspect
 from dataclasses import replace
-from importlib import import_module
-from importlib.util import resolve_name
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -29,7 +24,9 @@ from ray.data._internal.datasource_v2.common.non_sampling_file_indexer import (
 from ray.data._internal.datasource_v2.formats.parquet.parquet_datasource_v2 import (
     ParquetDatasourceV2,
 )
-from ray.data._internal.datasource_v2.interfaces.scanner import Scanner
+from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
+    ParquetScanner,
+)
 from ray.data._internal.logical.interfaces import (
     LogicalOperator,
     LogicalPlan,
@@ -37,6 +34,7 @@ from ray.data._internal.logical.interfaces import (
     Rule,
 )
 from ray.data._internal.logical.operators import (
+    Count,
     Filter,
     Limit,
     ListFiles,
@@ -51,16 +49,7 @@ from ray.data._internal.logical.rules.derive_list_files_pushdown import (
 from ray.data.context import DataContext
 from ray.data.datasource import FileShuffleConfig
 from ray.data.datasource.partitioning import Partitioning, PartitionStyle
-from ray.data.expressions import Expr, col
-
-
-def _footer_indexer(value):
-    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
-        FooterFileIndexer,
-    )
-
-    assert isinstance(value, FooterFileIndexer)
-    return value
+from ray.data.expressions import col
 
 
 def _mk_read_files(tmp_path: Path) -> ReadFiles:
@@ -134,6 +123,55 @@ def test_derives_state_the_scanner_accepted(tmp_path):
     assert list_files.predicate is predicate
     assert list_files.projected_columns == ["a"]
     assert list_files.limit == 5
+
+
+@pytest.mark.parametrize(
+    "shuffle_config,expected_limit",
+    [
+        (None, 10),
+        (FileShuffleConfig(seed=1), 10),
+        (FileShuffleConfig(seed=1, small_chunks_shuffle=True), None),
+    ],
+    ids=["no_shuffle", "file_shuffle", "small_chunks_shuffle"],
+)
+def test_partition_condition_reaches_reader_with_shuffle_aware_listing_limit(
+    tmp_path, shuffle_config, expected_limit
+):
+    read_files = _mk_read_files(tmp_path)
+    schema = read_files.schema.append(pa.field("year", pa.string()))
+    scanner = ParquetScanner(
+        schema=schema,
+        partitioning=Partitioning(PartitionStyle.HIVE, field_names=["year"]),
+    ).prune_partitions(col("year") == "2024")
+    scanner, _ = scanner.push_filters(col("a") > 2)
+    assert isinstance(scanner, ParquetScanner)
+    scanner = scanner.push_limit(10)
+    assert isinstance(scanner, ParquetScanner)
+    read_files = replace(
+        read_files,
+        scanner=scanner,
+        input_dependencies=[
+            replace(
+                _source_list_files(read_files),
+                shuffle_config_factory=lambda: shuffle_config,
+            )
+        ],
+    )
+    list_files = _list_files_of(_apply(read_files))
+    assert list_files.limit == expected_limit
+    assert scanner.pushed_limit() == 10
+    assert list_files.predicate is not None
+    assert list_files.partition_pruner is not None
+    assert list_files.predicate.structurally_equals(col("a") > 2)
+    assert list_files.partition_pruner.should_include(str(tmp_path / "root.parquet"))
+    assert not list_files.partition_pruner.should_include(
+        str(tmp_path / "year=2023" / "data.parquet")
+    )
+    reader = scanner.create_reader()
+    assert reader._predicate is not None
+    assert reader._predicate.structurally_equals(
+        (col("a") > 2) & (col("year") == "2024")
+    )
 
 
 @pytest.mark.parametrize(
@@ -235,6 +273,51 @@ def test_state_is_cleared_when_consumer_is_not_read_files(tmp_path):
 
     assert derived.predicate is None
     assert derived.limit is None
+
+
+def test_final_pushdown_is_left_alone(tmp_path):
+    """``pushdown_is_final`` keeps constraints a rule set for a non-``ReadFiles``.
+
+    ``PushdownCountFiles`` replaces the ``ReadFiles`` with a ``MapBatches``
+    that applies the filter through the same reader, so clearing the listing's
+    predicate would list the whole table and count it unfiltered.
+    """
+    read_files = _mk_read_files(tmp_path)
+    predicate = col("a") > 2
+    list_files = replace(
+        _source_list_files(read_files),
+        predicate=predicate,
+        pushdown_is_final=True,
+    )
+    count_rows = MapBatches(
+        fn=lambda batch: batch,
+        input_dependencies=[list_files],
+        batch_format="pyarrow",
+        can_modify_num_rows=True,
+    )
+
+    derived = _list_files_of(_apply(count_rows))
+
+    assert derived.predicate is predicate
+
+
+def test_count_pushdown_marks_its_listing_final(tmp_path):
+    """The real ``PushdownCountFiles`` sets ``pushdown_is_final`` on its listing.
+
+    Parquet only counts from footers with no filter, so the pinned predicate
+    here is ``None``; ``test_final_pushdown_is_left_alone`` covers one surviving.
+    """
+    read_files = _mk_read_files(tmp_path)
+
+    optimized = LogicalOptimizer().optimize(
+        LogicalPlan(
+            dag=Count(input_dependencies=[read_files]),
+            context=DataContext.get_current(),
+        )
+    )
+
+    assert isinstance(optimized.dag, MapBatches)
+    assert _list_files_of(optimized).pushdown_is_final
 
 
 class _WeakenScannerPredicate(Rule):
@@ -367,305 +450,6 @@ def test_block_udf_filter_keeps_listing_and_read_limit_unset(tmp_path, columns):
     assert listing.predicate is None
     assert listing.partition_pruner is None
     assert listing.limit is None
-
-
-def _previous_hint():
-    from ray.data._internal.datasource_v2.formats.parquet.listing_pruning import (
-        ListingPruningHint,
-    )
-    from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
-        ParquetScanner,
-    )
-
-    scanner = ParquetScanner(
-        schema=pa.schema([("a", pa.int64()), ("p", pa.string())]),
-        partitioning=Partitioning(PartitionStyle.HIVE, field_names=["p"]),
-    )
-    context = scanner.listing_pruning_context()
-    assert context is not None
-    return ListingPruningHint.from_residual(context, (col("p") == "a") | (col("a") > 9))
-
-
-@pytest.mark.parametrize(
-    "shape", ["bare", "read", "filter", "count", "non_read", "declined_scanner"]
-)
-def test_stale_hint_cleared_before_any_root_qualification(tmp_path, shape):
-    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
-        FooterFileIndexer,
-    )
-    from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
-        ParquetScanner,
-    )
-    from ray.data._internal.logical.operators.count_operator import Count
-
-    original = FooterFileIndexer(ignore_missing_paths=False)
-    hint = _previous_hint()
-    configured = original.with_listing_hint(hint)
-    read = _mk_read_files(tmp_path)
-    listing = replace(_source_list_files(read), file_indexer=configured)
-    q = col("a") > 1
-    assert isinstance(read.scanner, ParquetScanner)
-    read = replace(
-        read,
-        scanner=replace(read.scanner, predicate=q, columns=("a",), limit=5),
-        input_dependencies=[listing],
-    )
-    r = (col("a") < 99) | (col("b") == "x")
-    if shape == "bare":
-        root = listing
-    elif shape == "filter":
-        root = Filter(predicate_expr=r, input_dependencies=[read])
-    elif shape == "count":
-        root = Count(input_dependencies=[read])
-    elif shape == "non_read":
-        root = MapBatches(
-            fn=lambda batch: batch,
-            input_dependencies=[listing],
-            batch_format="pyarrow",
-            can_modify_num_rows=True,
-        )
-    elif shape == "declined_scanner":
-
-        class DecliningScanner(ParquetScanner):
-            def listing_pruning_context(self):
-                raise AssertionError("no context probe on an inactive/unknown source")
-
-        root = replace(read, scanner=DecliningScanner(schema=read.schema))
-    else:
-        root = read
-    derived = _apply(root)
-    cleared = _list_files_of(derived)
-    assert _footer_indexer(cleared.file_indexer)._listing_hint is None
-    assert cleared.file_indexer is not configured
-    assert configured._listing_hint is hint
-    assert original._listing_hint is None
-    assert (
-        _footer_indexer(_list_files_of(_apply(derived.dag)).file_indexer)._listing_hint
-        is None
-    )
-    if shape in ("read", "filter", "count"):
-        assert cleared.predicate is q
-        assert cleared.projected_columns == ["a"]
-        assert cleared.limit == 5
-    if shape == "filter":
-        assert isinstance(derived.dag, Filter)
-        assert derived.dag.predicate_expr is r
-
-
-def test_shared_indexer_and_replaced_root_are_independently_cleaned(tmp_path):
-    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
-        FooterFileIndexer,
-    )
-    from ray.data._internal.logical.operators.count_operator import Count
-    from ray.data._internal.logical.operators.n_ary_operator import Union
-
-    configured = FooterFileIndexer(ignore_missing_paths=False).with_listing_hint(
-        _previous_hint()
-    )
-    read = _mk_read_files(tmp_path)
-    listing = replace(_source_list_files(read), file_indexer=configured)
-    read = replace(read, input_dependencies=[listing])
-    first = _apply(Count(input_dependencies=[read]))
-    second = _apply(Filter(predicate_expr=col("a") > 0, input_dependencies=[read]))
-    assert _footer_indexer(_list_files_of(first).file_indexer)._listing_hint is None
-    assert _footer_indexer(_list_files_of(second).file_indexer)._listing_hint is None
-    assert configured._listing_hint is not None
-    # Include a shared-DAG repeated source and a bare listing with no ReadFiles.
-    result = _apply(Union(input_dependencies=[read, listing, read]))
-    listings = [
-        node for node in result.dag.post_order_iter() if isinstance(node, ListFiles)
-    ]
-    assert listings and all(
-        _footer_indexer(node.file_indexer)._listing_hint is None for node in listings
-    )
-    assert configured._listing_hint is not None
-
-
-@pytest.mark.parametrize("shape", ["bare", "read", "non_read"])
-def test_unknown_indexer_clear_override_is_never_called(tmp_path, shape):
-    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
-        FooterFileIndexer,
-    )
-
-    class CustomIndexer(FooterFileIndexer):
-        def with_listing_hint(self, hint):
-            raise AssertionError("custom hint callback must not be probed")
-
-    indexer = CustomIndexer(ignore_missing_paths=False)
-    read = _mk_read_files(tmp_path)
-    listing = replace(_source_list_files(read), file_indexer=indexer)
-    if shape == "bare":
-        root = listing
-    elif shape == "read":
-        root = replace(read, input_dependencies=[listing])
-    else:
-        root = MapBatches(
-            fn=lambda batch: batch,
-            input_dependencies=[listing],
-            batch_format="pyarrow",
-            can_modify_num_rows=True,
-        )
-    assert _list_files_of(_apply(root)).file_indexer is indexer
-
-
-class _CapabilityScanner(Scanner):
-    """A non-Parquet scanner with no format-specific limit attribute."""
-
-    def read_schema(self) -> pa.Schema:
-        return pa.schema([("a", pa.int64()), ("b", pa.string())])
-
-    def create_reader(self):
-        raise AssertionError("The logical rule must not instantiate a reader")
-
-
-class _CapabilityIndexer(NonSamplingFileIndexer):
-    """An independent implementation of the residual-pruning contract."""
-
-    residual: Optional[Expr] = None
-    scanner: Optional[Scanner] = None
-
-    def without_residual_pruning(self):
-        if self.residual is None:
-            return self
-        cleared = copy.copy(self)
-        cleared.residual = None
-        cleared.scanner = None
-        return cleared
-
-    def with_residual_pruning(self, scanner, residual):
-        configured = copy.copy(self)
-        configured.scanner = scanner
-        configured.residual = residual
-        return configured
-
-
-def test_residual_pruning_capability_defaults_to_noop():
-    indexer = NonSamplingFileIndexer(ignore_missing_paths=False)
-    assert indexer.without_residual_pruning() is indexer
-    assert indexer.with_residual_pruning(_CapabilityScanner(), col("a") > 1) is indexer
-
-
-def test_residual_pruning_rule_accepts_non_parquet_capability(tmp_path):
-    original = _CapabilityIndexer(ignore_missing_paths=False)
-    scanner = _CapabilityScanner()
-    read = _mk_read_files(tmp_path)
-    listing = replace(_source_list_files(read), file_indexer=original)
-    read = replace(read, scanner=scanner, input_dependencies=[listing])
-    residual = (col("a") > 1) | (col("b") == "x")
-    result = _apply(Filter(predicate_expr=residual, input_dependencies=[read]))
-    configured = _list_files_of(result).file_indexer
-    assert isinstance(configured, _CapabilityIndexer)
-    assert configured is not original
-    assert configured.scanner is scanner
-    assert configured.residual is residual
-    assert original.residual is None
-    assert isinstance(result.dag, Filter)
-    assert result.dag.predicate_expr is residual
-
-
-@pytest.mark.parametrize("shape", ["bare", "read", "count"])
-def test_independent_capability_clears_stale_hint_before_early_return(tmp_path, shape):
-    from ray.data._internal.logical.operators.count_operator import Count
-
-    original = _CapabilityIndexer(ignore_missing_paths=False)
-    scanner = _CapabilityScanner()
-    residual = col("a") > 1
-    configured = original.with_residual_pruning(scanner, residual)
-    read = _mk_read_files(tmp_path)
-    listing = replace(_source_list_files(read), file_indexer=configured)
-    read = replace(read, scanner=scanner, input_dependencies=[listing])
-    root = listing if shape == "bare" else read
-    if shape == "count":
-        root = Count(input_dependencies=[read])
-    cleared = _list_files_of(_apply(root)).file_indexer
-    assert isinstance(cleared, _CapabilityIndexer)
-    assert cleared is not configured
-    assert cleared.residual is None
-    assert configured.residual is residual
-    assert original.residual is None
-
-
-def test_parquet_adapter_declines_mismatched_scanner_and_reader_limit():
-    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
-        FooterFileIndexer,
-    )
-    from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
-        ParquetScanner,
-    )
-
-    indexer = FooterFileIndexer(ignore_missing_paths=False)
-    residual = (col("p") == "a") | (col("a") > 9)
-    assert indexer.with_residual_pruning(_CapabilityScanner(), residual) is indexer
-    scanner = ParquetScanner(
-        schema=pa.schema([("a", pa.int64()), ("p", pa.string())]),
-        partitioning=Partitioning(PartitionStyle.HIVE, field_names=["p"]),
-    )
-    assert indexer.with_residual_pruning(replace(scanner, limit=1), residual) is indexer
-    configured = indexer.with_residual_pruning(scanner, residual)
-    assert configured is not indexer
-    assert configured._listing_hint is not None
-    assert indexer._listing_hint is None
-    assert configured.without_residual_pruning()._listing_hint is None
-
-
-def test_parquet_capability_requires_explicit_subclass_admission():
-    from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
-        FooterFileIndexer,
-    )
-    from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
-        ParquetScanner,
-    )
-
-    class DerivedIndexer(FooterFileIndexer):
-        def with_listing_hint(self, hint):
-            raise AssertionError(
-                "Legacy hook does not opt a subclass into the capability"
-            )
-
-    class DerivedScanner(ParquetScanner):
-        def listing_pruning_context(self):
-            raise AssertionError("Unknown scanner semantics must not be probed")
-
-    residual = (col("p") == "a") | (col("a") > 9)
-    scanner = ParquetScanner(
-        schema=pa.schema([("a", pa.int64()), ("p", pa.string())]),
-        partitioning=Partitioning(PartitionStyle.HIVE, field_names=["p"]),
-    )
-    derived = DerivedIndexer(ignore_missing_paths=False)
-    assert derived.without_residual_pruning() is derived
-    assert derived.with_residual_pruning(scanner, residual) is derived
-    indexer = FooterFileIndexer(ignore_missing_paths=False)
-    unknown = DerivedScanner(schema=scanner.schema, partitioning=scanner.partitioning)
-    assert indexer.with_residual_pruning(unknown, residual) is indexer
-
-
-@pytest.mark.parametrize(
-    "module_name",
-    [
-        "ray.data._internal.datasource_v2.common.listing_pruning",
-        "ray.data._internal.logical.rules.derive_list_files_pushdown",
-    ],
-)
-def test_listing_layers_do_not_import_format_implementations(module_name):
-    """Keep direct format dependencies out of shared expression and plan logic."""
-    module = import_module(module_name)
-    tree = ast.parse(inspect.getsource(module))
-    format_package = "ray.data._internal.datasource_v2.formats"
-    dependencies = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            dependencies.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            package = resolve_name(
-                "." * node.level + (node.module or ""),
-                module_name.rpartition(".")[0],
-            )
-            dependencies.append(package)
-            dependencies.extend(f"{package}.{alias.name}" for alias in node.names)
-    assert not any(
-        name == format_package or name.startswith(f"{format_package}.")
-        for name in dependencies
-    ), dependencies
 
 
 if __name__ == "__main__":

@@ -1,35 +1,36 @@
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import logging
+import math
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from threading import Lock
 from typing import (
     TYPE_CHECKING,
     AbstractSet,
     Iterable,
     Iterator,
     NamedTuple,
-    Optional,
     Tuple,
 )
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pds
 import pyarrow.fs as pafs
-import pyarrow.parquet as pq
 from pyarrow.parquet import ColumnSchema, ParquetSchema, RowGroupMetaData
 
 import ray
-from ray.data._internal.datasource_v2.common.listing_pruning import (
-    substitute_partition_values,
+from ray.data._internal.datasource_v2.common.file_pruners import (
+    PartitionPredicatePruner,
 )
-from ray.data._internal.datasource_v2.formats.parquet.listing_pruning import (
-    ListingPruningHint,
-    logical_schema_signature,
+from ray.data._internal.datasource_v2.common.partitioning_utils import (
+    _evaluate_path_predicate,
+    _partition_table,
+    _PartitionValueParser,
+)
+from ray.data._internal.datasource_v2.common.pushdown_utils import (
+    _split_predicate_by_columns,
+    combine_predicates,
 )
 from ray.data._internal.datasource_v2.formats.parquet.parquet_file_chunking_utils import (
     _row_group_unit_id,
@@ -46,38 +47,28 @@ from ray.data._internal.planner.plan_expression.expression_visitors import (
     get_column_references,
 )
 from ray.data._internal.util import call_with_retry, filesystem_for_sized_opens
-from ray.data.datasource.partitioning import (
-    Partitioning,
-    PartitionStyle,
-    PathPartitionParser,
-    _broadcast_partition_value,
+from ray.data.datasource.partitioning import Partitioning
+from ray.data.expressions import (
+    AliasExpr,
+    BinaryExpr,
+    ColumnExpr,
+    LiteralExpr,
+    Operation,
+    UnaryExpr,
+    _PyArrowExpressionVisitor,
 )
 
 if TYPE_CHECKING:
-    import pyarrow.compute as pc
-
+    from ray.data._internal.datasource_v2.interfaces.synthesized_columns import (
+        SynthesizedColumn,
+    )
     from ray.data.expressions import Expr
 
-logger = logging.getLogger(__name__)
+ResidualPruning = Tuple[
+    "Expr", Partitioning, pa.Schema, tuple["SynthesizedColumn", ...]
+]
 
-# No paths, values, schema names or exception text may enter this diagnostic.
-_LISTING_DECLINE_REASONS = frozenset(
-    {
-        "logical_schema",
-        "non_native_footer",
-        "unsupported_fixed_signature",
-        "physical_column_count_mismatch",
-        "unsupported_physical_column",
-        "unsupported_integer_annotation",
-        "unsupported_footer_metadata",
-        "unsupported_encoded_schema",
-        "noncanonical_embedded_schema",
-        "physical_schema_analysis_failed",
-        "partition_values_unavailable",
-        "unsupported_expression",
-        "optional_analysis_failed",
-    }
-)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -86,11 +77,6 @@ class ChunkedFile:
 
     file: FileInfo  # path and on-disk size, from the file listing
     row_groups: Tuple[FileChunk, ...]
-    # Exact inputs to the shared output layout: physical data uses the pinned
-    # schema, partitions append in fixed field-name order, then projection.
-    schema_only_layout: Optional[
-        Tuple[bytes, Tuple[str, ...], Optional[Tuple[str, ...]]]
-    ] = None
 
 
 def _get_prefix_matches(path: str, names: set[str]) -> set[str]:
@@ -139,15 +125,6 @@ class _FilterLeaves(NamedTuple):
     has_float_leaf: bool = False
 
 
-def _schema_only_layout_key(hint, projected_columns):
-    context = hint.context
-    return (
-        context.schema.serialize().to_pybytes(),
-        context.partitioning.field_names,
-        projected_columns,
-    )
-
-
 class FooterReader:
     """Reads Parquet footers and chunks files into row-group runs.
 
@@ -167,8 +144,12 @@ class FooterReader:
         coalesce_bytes: int = 0,
         retried_io_errors: list[str] | None = None,
         excluded_read_unit_ids: AbstractSet[str] | None = None,
+        partitioning: Partitioning | None = None,
+        partition_pruner: PartitionPredicatePruner | None = None,
+        logical_schema: pa.Schema | None = None,
         *,
-        listing_hint: ListingPruningHint | None = None,
+        residual_pruning: ResidualPruning | None = None,
+        residual_read_options: pds.ParquetReadOptions | None = None,
     ):
         from ray.data.context import DEFAULT_RETRIED_IO_ERRORS
 
@@ -181,30 +162,55 @@ class FooterReader:
         # ~coalesce_bytes uncompressed before returning them, so the driver packs
         # fewer items. 0 disables coalescing (one chunk per physical row group).
         self.coalesce_bytes = coalesce_bytes
-        self.projected_columns = (
-            None if projected_cols is None else tuple(projected_cols)
-        )
         # Read unit ids a checkpoint already finished (``"<path>#rg<N>"`` for a
         # row group). Those row groups are left out of every ``ChunkedFile``.
         self.excluded_read_unit_ids: AbstractSet[str] = (
             excluded_read_unit_ids or frozenset()
         )
         self.filesystem = filesystem
-        self.listing_hint = listing_hint
-        # Only immutable bytes/tuples cross footer threads. Prepare before the
-        # pool starts; this optional failure must not fail ordinary reading.
-        self._schema_only_layout = None
-        if listing_hint is not None:
+        self.partitioning = (
+            partition_pruner.partitioning
+            if partition_pruner is not None
+            else partitioning
+        )
+        self.logical_schema = (
+            partition_pruner.schema if partition_pruner is not None else logical_schema
+        )
+        self._predicate = combine_predicates(
+            filter_expr,
+            partition_pruner.predicate if partition_pruner is not None else None,
+        )
+        self._partition_value_parser = (
+            _PartitionValueParser(self.partitioning)
+            if self.partitioning is not None and self._predicate is not None
+            else None
+        )
+        self.residual_pruning = residual_pruning
+        self.residual_read_options = residual_read_options
+        self._residual_partition_value_parser = None
+        if residual_pruning is not None:
             try:
-                self._schema_only_layout = _schema_only_layout_key(
-                    listing_hint, self.projected_columns
+                partitioning = residual_pruning[1]
+                self._residual_partition_value_parser = (
+                    self._partition_value_parser
+                    if self._partition_value_parser is not None
+                    and partitioning == self.partitioning
+                    else _PartitionValueParser(partitioning)
                 )
             except Exception:
-                pass
-        # Local actor state only; never serialized in the hint/context. Initialize
-        # before starting concurrent footer work, including on Python 3.12+.
-        self._listing_decline_lock = Lock() if listing_hint is not None else None
-        self._listing_decline_reported = False
+                # Q's parser initialization above must still raise normally;
+                # only initialization needed exclusively by R is optional.
+                self.residual_pruning = None
+        self._can_bind_residual_partitions = True
+        if self.residual_pruning is not None and self._predicate is not None:
+            try:
+                # Validate Q's grammar once before sharing partition facts.
+                # Native expressions in compute data operands can hide field
+                # references from get_column_references, so cannot share facts.
+                _validate_predicate_references(self._predicate)
+            except Exception:
+                self._can_bind_residual_partitions = False
+        filter_expr = self._predicate
         self.pool = ThreadPoolExecutor(max_workers=io_concurrency)
         # Match Arrow's process-wide pools to the actor's IO concurrency so
         # nested S3/footer work isn't bottlenecked on the default 8 threads.
@@ -276,7 +282,9 @@ class FooterReader:
             fully_matched=fully_matched,
         )
 
-    def _locate_filter_columns(self, schema: ParquetSchema) -> _FilterLeaves:
+    def _locate_filter_columns(
+        self, schema: ParquetSchema, columns: set[str] | None = None
+    ) -> _FilterLeaves:
         # Resolve the predicate's column names to Parquet leaf-column indices,
         # the same mapping ``_read_leaf_indices`` does for the read columns.
         # Called once per file so the per-row-group null check below is an
@@ -285,19 +293,74 @@ class FooterReader:
         # Read off the schema rather than a row group because a leaf's logical
         # type lives there, whereas a row group only exposes it via statistics
         # -- which a file need not carry.
-        if not self.filter_columns:
+        columns = self.filter_columns if columns is None else columns
+        if not columns:
             return _FilterLeaves([], True)
         indices: list[int] = []
         matched: set[str] = set()
         has_float_leaf = False
         for j in range(len(schema)):
             column = schema.column(j)
-            hits = _get_prefix_matches(column.path, self.filter_columns)
+            hits = _get_prefix_matches(column.path, columns)
             if hits:
                 matched.update(hits)
                 indices.append(j)
                 has_float_leaf = has_float_leaf or _is_float_leaf(column)
-        return _FilterLeaves(indices, matched == self.filter_columns, has_float_leaf)
+        return _FilterLeaves(indices, matched == columns, has_float_leaf)
+
+    def _filter_for_file(
+        self, path: str, schema: ParquetSchema
+    ) -> tuple[pc.Expression | None, set[str], bool]:
+        """Select safe physical conditions and whether they cover the full filter."""
+        if self._predicate is None or (
+            self.partitioning is None and self.logical_schema is None
+        ):
+            return self.filter, self.filter_columns, True
+        values = (
+            self._partition_value_parser(path)
+            if self._partition_value_parser is not None
+            else {}
+        )
+        split = _split_predicate_by_columns(self._predicate, set(values))
+        complete = split.residual_predicate is None
+        if split.partition_predicate is not None:
+            # Without the logical schema, path types alone cannot prove the
+            # reader's output values. Keep the groups but do not count them.
+            complete = complete and self.logical_schema is not None
+            if complete:
+                complete = (
+                    _evaluate_path_predicate(
+                        split.partition_predicate,
+                        values,
+                        self.logical_schema,
+                        path=path,
+                    )
+                    is True
+                )
+        physical = split.data_predicate
+        logical_schema = self.logical_schema
+        if physical is not None and logical_schema is not None:
+            physical_schema = schema.to_arrow_schema()
+            unsafe = {
+                name
+                for name in get_column_references(physical)
+                if physical_schema.get_field_index(name) != -1
+                and (
+                    logical_schema.get_field_index(name) == -1
+                    or physical_schema.field(name).type
+                    != logical_schema.field(name).type
+                )
+            }
+            if unsafe:
+                safe = _split_predicate_by_columns(physical, unsafe)
+                physical = safe.data_predicate
+                complete = False
+        if physical is None:
+            return None, set(), complete
+        expression = (
+            self.filter if physical is self._predicate else physical.to_pyarrow()
+        )
+        return expression, set(get_column_references(physical)), complete
 
     def _has_filter_nulls(
         self, row_group: RowGroupMetaData, indices: list[int]
@@ -341,7 +404,11 @@ class FooterReader:
         return not self._has_filter_nulls(row_group, filter_leaves.indices)
 
     def _try_split_by_row_group(
-        self, fragment, expr: "pc.Expression", path: str
+        self,
+        fragment,
+        expr: "pc.Expression",
+        path: str,
+        schema: pa.Schema | None = None,
     ) -> list[int] | None:
         """Row-group ids that statistics say may match ``expr``, or None on failure.
 
@@ -350,7 +417,10 @@ class FooterReader:
         exception so one mismatched file cannot abort a ``read_footers`` batch.
         """
         try:
-            return [sub.row_groups[0].id for sub in fragment.split_by_row_group(expr)]
+            return [
+                sub.row_groups[0].id
+                for sub in fragment.split_by_row_group(expr, schema=schema)
+            ]
         except Exception as e:
             logger.debug(
                 "Error splitting by row group: %s for file %s",
@@ -360,122 +430,111 @@ class FooterReader:
             )
             return None
 
-    def _report_listing_decline(self, reason: str) -> None:
-        """At most one debug logging attempt per reader; never affect fallback.
-
-        The first thread to acquire the lock wins. This is not a per-file or
-        aggregate statistic. Disabled debugging neither takes the lock nor
-        consumes the opportunity to report a later decline.
-        """
-        try:
-            if not logger.isEnabledFor(logging.DEBUG):
-                return
-            lock = self._listing_decline_lock
-            if lock is None:
-                return
-            if type(reason) is not str or reason not in _LISTING_DECLINE_REASONS:
-                reason = "optional_analysis_failed"
-            with lock:
-                if self._listing_decline_reported:
-                    return
-                self._listing_decline_reported = True
-            # Logging handlers run outside the lock, and a failed attempt is not
-            # retried. Even a user-installed failing handler must not fail a read.
-            logger.debug(
-                "Optional listing pruning retained baseline: first observed "
-                "decline=%s; further declines for this reader are not reported",
-                reason,
-            )
-        except Exception:
-            pass
-
-    def _partition_filter_inputs(
-        self, hint: ListingPruningHint, path: str
-    ) -> Optional[Tuple["Expr", dict[str, object]]]:
-        """Resolve referenced partition values using the actual reader semantics."""
-        context = hint.context
-        partitioning = context.partitioning
-        python_types = {"int64": int, "bool": bool, "string": str}
-        parser = PathPartitionParser(
-            Partitioning(
-                PartitionStyle.HIVE,
-                base_dir=partitioning.base_dir,
-                field_names=list(partitioning.field_names),
-                field_types={
-                    name: python_types[tag] for name, tag in partitioning.field_types
-                },
-                filesystem=self.filesystem,
-            )
-        )
-        values = parser(path)
-        residual = hint.residual
-        referenced = set(get_column_references(residual)) & set(
-            partitioning.field_names
-        )
-        if not referenced or not set(partitioning.field_names).issubset(values):
+    def _residual_partition_facts(
+        self, path: str
+    ) -> tuple[pc.Expression, set[str], set[str]] | None:
+        """Prepare native facts, overwritten names, and successfully bound names."""
+        parser = self._residual_partition_value_parser
+        if self.residual_pruning is None or parser is None:
             return None
-        typed_values = {
-            name: _broadcast_partition_value(name, values[name], 1, context.schema)[
-                0
-            ].as_py()
-            for name in partitioning.field_names
-        }
-        return residual, {name: typed_values[name] for name in referenced}
-
-    def _apply_listing_hint(self, fragment, metadata, baseline, path):
-        """Narrow only after layout certification; keep Q and the residual.
-
-        The boolean result certifies an empty-output layout, including when Q
-        already excluded every group. Failed analysis keeps the original path.
-        """
-        hint = self.listing_hint
-        if hint is None or self.excluded_read_unit_ids:
-            return baseline, False
         try:
-            if self._schema_only_layout is None:
-                self._report_listing_decline("optional_analysis_failed")
-                return baseline, False
-            context = hint.context
-            signature = logical_schema_signature(context.schema)
-            if signature is None:
-                self._report_listing_decline("logical_schema")
-                return baseline, False
-            reason = physical_schema_decline_reason(
-                metadata, context.file_schema_signature
-            )
-            if reason is not None:
-                self._report_listing_decline(reason)
-                return baseline, False
-            inputs = self._partition_filter_inputs(hint, path)
-            if inputs is None:
-                self._report_listing_decline("partition_values_unavailable")
-                return baseline, False
-            residual, typed_values = inputs
-            expression = substitute_partition_values(residual, typed_values, signature)
-            if expression is None:
-                self._report_listing_decline("unsupported_expression")
-                return baseline, False
-            possible = {
-                sub.row_groups[0].id
-                for sub in fragment.split_by_row_group(
-                    expression.to_pyarrow(), schema=context.file_schema
-                )
+            expr, _, logical_schema, synthesized = self.residual_pruning
+            references = set(get_column_references(expr))
+            synthesized_names = {column.name for column in synthesized}
+            values = parser(path)
+            values = {
+                name: value
+                for name, value in values.items()
+                if name in references and name not in synthesized_names
             }
-            selected = [i for i in baseline if i in possible]
-            return selected, True
+            # Only keys actually present in this path are facts. A missing key
+            # can be a physical column at the root, rather than an implicit NULL.
+            # With the same parser, _filter_for_file removes these keys from Q.
+            # With a different parser, do not bind any possible Q reference.
+            blocked = (
+                self.filter_columns
+                if parser is not self._partition_value_parser
+                else set()
+            )
+            if not self._can_bind_residual_partitions:
+                blocked = set(values)
+            # Preserve R's existing fallback on incompatible path conversion,
+            # even when a converted value cannot be bound as a shared fact.
+            partition_table = _partition_table(values, logical_schema)
+            partition_expression = pds.scalar(True)
+            bound_partition_columns = set()
+            for name in values:
+                if name in blocked:
+                    continue
+                scalar = partition_table[name][0]
+                if (
+                    scalar.is_valid
+                    and pa.types.is_floating(scalar.type)
+                    and math.isnan(scalar.as_py())
+                ):
+                    # NaN == NaN is not a true partition fact. Its overwrite
+                    # also makes same-named physical statistics unusable.
+                    continue
+                fact = (
+                    pds.field(name) == pds.scalar(scalar)
+                    if scalar.is_valid
+                    else pds.field(name).is_null()
+                )
+                partition_expression = partition_expression & fact
+                bound_partition_columns.add(name)
+            return partition_expression, set(values), bound_partition_columns
         except Exception:
-            # Only new optional work: original footer, Q and later reader errors
-            # remain outside this handler. Declining never manufactures schema-only evidence.
-            self._report_listing_decline("optional_analysis_failed")
-            return baseline, False
+            return None
+
+    def _residual_row_groups(
+        self,
+        fragment,
+        schema: ParquetSchema,
+        candidates: Iterable[int],
+        facts: tuple[pc.Expression, set[str], set[str]] | None,
+    ) -> list[int] | None:
+        """Additional possible groups, never evidence for ``fully_matched``."""
+        if self.residual_pruning is None or facts is None:
+            return None
+        candidates = list(candidates)
+        if not candidates:
+            return None
+        try:
+            expr, _, logical_schema, synthesized = self.residual_pruning
+            references = set(get_column_references(expr))
+            synthesized_names = {column.name for column in synthesized}
+            _, overwritten_columns, bound_partition_columns = facts
+            unknown_columns = (
+                (
+                    reader_unknown_columns(
+                        schema, logical_schema, references, self.residual_read_options
+                    )
+                    | overwritten_columns
+                )
+                - bound_partition_columns
+            ) | synthesized_names
+            bound = _validate_residual_expression(expr, logical_schema, unknown_columns)
+            bound = _PyArrowExpressionVisitor(preserve_scalar_types=True).visit(bound)
+            # Share the already-read metadata, but give R its own statistics
+            # cache when binding against the reader's logical schema.
+            fragment = fragment.subset(row_group_ids=candidates)
+        except Exception:
+            return None
+        return self._try_split_by_row_group(
+            fragment, bound, fragment.path, logical_schema
+        )
 
     def _read_and_chunk(self, file: FileInfo) -> ChunkedFile:
         path = file.path
+        residual_facts = self._residual_partition_facts(path)
         # The listing's size spares the open a request for it (a HEAD on S3).
         fragment = self.file_format.make_fragment(
             path,
             filesystem=filesystem_for_sized_opens(self.filesystem),
             file_size=file.size,
+            partition_expression=residual_facts[0]
+            if residual_facts is not None
+            else None,
         )
         # ``make_fragment`` is lazy, so this property is the footer read itself
         # (and caches it on the fragment). It raises on a truncated, non-Parquet,
@@ -491,7 +550,10 @@ class FooterReader:
         # single schema, so resolve them once rather than rescanning every leaf
         # for each group. The read-column lookup reads leaf paths off row group 0,
         # which a file with no row groups has none of; it sizes nothing either way.
-        filter_leaves = self._locate_filter_columns(metadata.schema)
+        file_filter, filter_columns, complete_filter = self._filter_for_file(
+            path, metadata.schema
+        )
+        filter_leaves = self._locate_filter_columns(metadata.schema, filter_columns)
         leaf_indices = (
             self._read_leaf_indices(metadata.row_group(0))
             if metadata.num_row_groups
@@ -511,15 +573,14 @@ class FooterReader:
             # the listing stop early and the resumed job return too few rows.
             fragment = fragment.subset(row_group_ids=unprocessed_rg_ids)
 
-        predicate = self.filter
-        if predicate is not None and filter_leaves.all_filter_columns_found:
+        if file_filter is not None and filter_leaves.all_filter_columns_found:
             # Predicate pushdown: drop row groups whose Parquet statistics
             # contradict the filter, so we never emit chunks the reader would
             # skip anyway. Each returned fragment views a single surviving group.
             # Fail closed on any split error -- keep every group -- so a type
             # mismatch or similar cannot abort the rest of the read_footers batch.
             surviving: list[int] | None = self._try_split_by_row_group(
-                fragment, predicate, path
+                fragment, file_filter, path
             )
             rg_indices: Iterable[int] = (
                 unprocessed_rg_ids if surviving is None else surviving
@@ -530,7 +591,7 @@ class FooterReader:
             # out. For those, num_rows is an exact survivor count and can drive
             # the limit push-down. Any failure defaults to "not fully matched",
             # which is always safe (falls back to the post-filter stop).
-            not_fully_ids = self._try_split_by_row_group(fragment, ~predicate, path)
+            not_fully_ids = self._try_split_by_row_group(fragment, ~file_filter, path)
             not_fully = set(rg_indices) if not_fully_ids is None else set(not_fully_ids)
             # The negation test alone is not sufficient: ``~filter`` can prune a
             # group that still holds a row the filter does not return, and then
@@ -540,11 +601,12 @@ class FooterReader:
             # -- which holds however clever the engine's statistics pruning gets.
             # PyArrow declines the null prune today but already makes the NaN one.
             fully_by_idx: dict[int, bool] = {
-                i: i not in not_fully
+                i: complete_filter
+                and i not in not_fully
                 and self._rg_can_fully_match(metadata.row_group(i), filter_leaves)
                 for i in rg_indices
             }
-        elif self.filter is not None:
+        elif file_filter is not None:
             # A predicate column is absent from this file's schema. PyArrow's
             # split_by_row_group raises ArrowInvalid ("No match for FieldRef.Name")
             # in that case, which would abort the whole read_footers batch.
@@ -554,13 +616,16 @@ class FooterReader:
             fully_by_idx = dict.fromkeys(rg_indices, False)
         else:
             rg_indices = unprocessed_rg_ids
-            # No predicate -> nothing to disqualify a group, so the lookup below
-            # falls through to its fully-matched default for every group.
-            fully_by_idx = {}
+            # No physical predicate does not prove a missing path condition.
+            fully_by_idx = dict.fromkeys(rg_indices, complete_filter)
 
-        rg_indices, layout_certified = self._apply_listing_hint(
-            fragment, metadata, list(rg_indices), path
+        selected = self._residual_row_groups(
+            fragment, metadata.schema, rg_indices, residual_facts
         )
+        if selected is not None:
+            possible = set(selected)
+            rg_indices = [i for i in rg_indices if i in possible]
+
         per_rg = [
             self._row_group_run(
                 row_group=metadata.row_group(rg_idx),
@@ -574,8 +639,7 @@ class FooterReader:
         # coalesce_bytes == 0) so only a handful of descriptors per file reach the
         # driver's bin-packer instead of one per physical row group.
         row_groups = coalesce_row_groups(per_rg, self.coalesce_bytes)
-        layout = self._schema_only_layout if layout_certified else None
-        return ChunkedFile(file=file, row_groups=row_groups, schema_only_layout=layout)
+        return ChunkedFile(file=file, row_groups=row_groups)
 
     @ray.method(num_returns="streaming")
     def read_footers(
@@ -611,7 +675,7 @@ class FooterReader:
         total_row_groups = 0
         for finished in ordered:
             chunk = finished.result()
-            if not chunk.row_groups and chunk.schema_only_layout is None:
+            if not chunk.row_groups:
                 # Only occurs if the file is empty or all row groups are filtered out.
                 continue
             total_row_groups += len(chunk.row_groups)
@@ -631,126 +695,128 @@ class FooterReader:
 FooterReaderActor = ray.remote(FooterReader)
 
 
-PrimitiveSignature = Tuple[Tuple[str, str], ...]
-_MAX_COLUMNS = 1024
-_MAX_NAME_BYTES = 4096
-_MAX_ENCODED_SCHEMA_BYTES = 1 << 20
-_PHYSICAL_TYPES = {
-    "float64": ("DOUBLE", "NONE", "NONE"),
-    "int8": ("INT32", "INT", "INT_8"),
-    "int16": ("INT32", "INT", "INT_16"),
-    "int32": ("INT32", "NONE", "NONE"),
-    "int64": ("INT64", "NONE", "NONE"),
-    "bool": ("BOOLEAN", "NONE", "NONE"),
-    "string": ("BYTE_ARRAY", "STRING", "UTF8"),
-}
+_COMPARISONS = frozenset(
+    (Operation.EQ, Operation.NE, Operation.LT, Operation.LE, Operation.GT, Operation.GE)
+)
 
 
-def _valid_signature(signature: PrimitiveSignature) -> bool:
-    if type(signature) is not tuple or not 0 < len(signature) <= _MAX_COLUMNS:
-        return False
-    names = set()
-    for item in signature:
-        if type(item) is not tuple or len(item) != 2:
-            return False
-        name, tag = item
-        if type(name) is not str or type(tag) is not str:
-            return False
-        if not name or "." in name or name in names or tag not in _PHYSICAL_TYPES:
-            return False
-        if len(name) > _MAX_NAME_BYTES or len(name.encode("utf-8")) > _MAX_NAME_BYTES:
-            return False
-        names.add(name)
-    return True
+def _validate_predicate_references(expr: "Expr"):
+    """Require Q's native fields to be visible to the Ray reference collector."""
+    # Only built-in nodes have the audited collector/lowering correspondence.
+    if type(expr) is ColumnExpr and isinstance(expr.name, str):
+        return
+    if type(expr) is LiteralExpr:
+        # Constants may have any scalar type, but cannot embed native fields.
+        pa.scalar(expr.value)
+    elif type(expr) is AliasExpr:
+        _validate_predicate_references(expr.expr)
+    elif type(expr) is UnaryExpr:
+        _validate_predicate_references(expr.operand)
+    elif type(expr) is BinaryExpr:
+        _validate_predicate_references(expr.left)
+        _validate_predicate_references(expr.right)
+    else:
+        # Compute UDF options/positional operands can hide native field refs.
+        raise ValueError("Opaque native predicate operands")
 
 
-def _canonical_schema_matches(encoded: bytes, canonical: bytes) -> bool:
-    """Validate untrusted IPC bytes without asking Arrow to decode them."""
-    if type(encoded) is not bytes or not 0 < len(encoded) <= _MAX_ENCODED_SCHEMA_BYTES:
-        return False
-    try:
-        decoded = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error):
-        return False
-    # Reject alternate padding and nonzero unused bits, as well as IPC tails.
-    return base64.b64encode(decoded) == encoded and decoded == canonical
+def _validate_residual_expression(expr: "Expr", schema, unknown_columns=frozenset()):
+    """Use native statistics only for an unchanged, row-local expression.
 
-
-def physical_schema_decline_reason(
-    metadata: pq.FileMetaData, signature: PrimitiveSignature
-) -> Optional[str]:
-    """None only for an exact supported primitive physical footer layout.
-
-    The signature must come from an independently admitted fixed reader pin.
-    The caller also owns format-option, partition, Q/R and consumer admission.
-    Required footer acquisition must finish before entering this optional check.
-    A decline requires preserving the caller's complete baseline group sequence.
+    Unsafe expressions disable this optional hint as a whole. The original
+    pushed predicate and residual Filter still run, so this costs only pruning.
+    In particular, Arrow statistics can lose NaNs for negated comparisons and
+    distinguish signed zeros differently from eager IN evaluation.
     """
-    if type(metadata) is not pq.FileMetaData:
-        return "non_native_footer"
-    try:
-        if not _valid_signature(signature):
-            return "unsupported_fixed_signature"
-        raw = metadata.schema
-        if type(raw) is not pq.ParquetSchema or len(raw) != len(signature):
-            return "physical_column_count_mismatch"
-        arrow_types = {
-            "float64": pa.float64(),
-            "int8": pa.int8(),
-            "int16": pa.int16(),
-            "int32": pa.int32(),
-            "int64": pa.int64(),
-            "bool": pa.bool_(),
-            "string": pa.string(),
-        }
-        fields = []
-        for index, (name, tag) in enumerate(signature):
-            column = raw.column(index)
-            if (
-                column.name != name
-                or column.path != name
-                or column.max_repetition_level != 0
-                or column.max_definition_level not in (0, 1)
-                or (
-                    column.physical_type,
-                    column.logical_type.type,
-                    column.converted_type,
-                )
-                != _PHYSICAL_TYPES[tag]
-            ):
-                return "unsupported_physical_column"
-            # INT32 also stores unsigned integers, dates and decimals. For
-            # narrow signed integers, certify the native logical annotation's
-            # exact width and signedness as well as the physical/converted types.
-            if tag in ("int8", "int16") and json.loads(
-                column.logical_type.to_json()
-            ) != {"Type": "Int", "bitWidth": int(tag[3:]), "isSigned": True}:
-                return "unsupported_integer_annotation"
-            fields.append(
-                pa.field(
-                    name, arrow_types[tag], nullable=column.max_definition_level == 1
-                )
-            )
-        key_values = metadata.metadata
-        if key_values is None:
-            return None
-        if type(key_values) is not dict or any(
-            type(key) is not bytes or key != b"ARROW:schema" for key in key_values
-        ):
-            return "unsupported_footer_metadata"
-        if not key_values:
-            return None
-        encoded = key_values[b"ARROW:schema"]
+
+    def column_type(column):
+        if column.name in unknown_columns:
+            raise ValueError("Reader changes the column domain")
+        i = schema.get_field_index(column.name)
+        if i < 0:
+            raise ValueError("Unknown column")
+        t = schema.field(i).type
         if (
-            type(encoded) is not bytes
-            or not 0 < len(encoded) <= _MAX_ENCODED_SCHEMA_BYTES
+            pa.types.is_nested(t)
+            or pa.types.is_dictionary(t)
+            or isinstance(t, pa.BaseExtensionType)
         ):
-            return "unsupported_encoded_schema"
-        canonical = pa.schema(fields).serialize().to_pybytes()
-        if not _canonical_schema_matches(encoded, canonical):
-            return "noncanonical_embedded_schema"
-        return None
-    except Exception:
-        # Only optional in-memory analysis is enclosed. No required footer read,
-        # schema deserializer, file open, or callback-capable schema input occurs.
-        return "physical_schema_analysis_failed"
+            raise ValueError("Non-scalar reader domain")
+        return t
+
+    def visit(e):
+        if isinstance(e, AliasExpr):
+            visit(e.expr)
+        elif isinstance(e, (ColumnExpr, LiteralExpr)):
+            t = column_type(e) if isinstance(e, ColumnExpr) else pa.scalar(e.value).type
+            if pa.types.is_floating(t) or pa.types.is_nested(t):
+                raise ValueError("Unsafe statistics value domain")
+        elif isinstance(e, UnaryExpr) and e.op == Operation.NOT:
+            visit(e.operand)
+        elif (
+            isinstance(e, UnaryExpr)
+            and e.op in (Operation.IS_NULL, Operation.IS_NOT_NULL)
+            and isinstance(e.operand, ColumnExpr)
+        ):
+            # Nullness does not depend on floating-point comparison semantics.
+            column_type(e.operand)
+        elif isinstance(e, BinaryExpr) and e.op in (
+            *_COMPARISONS,
+            Operation.AND,
+            Operation.OR,
+            Operation.ADD,
+            Operation.SUB,
+            Operation.MUL,
+        ):
+            # Let Arrow bind and simplify the unchanged native expression rather
+            # than requiring a column/scalar shape or deriving new bounds.
+            visit(e.left)
+            visit(e.right)
+        elif (
+            isinstance(e, BinaryExpr)
+            and e.op in (Operation.IN, Operation.NOT_IN)
+            and isinstance(e.left, ColumnExpr)
+            and isinstance(e.right, LiteralExpr)
+        ):
+            visit(e.left)
+            if not isinstance(e.right.value, list):
+                raise ValueError("Not a literal value set")
+            values_type = pa.array(e.right.value).type
+            if not pa.types.is_null(values_type) and values_type != column_type(e.left):
+                raise ValueError("Membership changes the scalar domain")
+        else:
+            raise ValueError("Unverified statistics expression")
+
+    visit(expr)
+    return expr
+
+
+def reader_unknown_columns(
+    parquet_schema, reader_schema, references, read_options=None
+):
+    """Identify incompatible reader domains; schema equality is not sufficient."""
+    physical = (
+        parquet_schema
+        if isinstance(parquet_schema, pa.Schema)
+        else parquet_schema.to_arrow_schema()
+    )
+    logical = physical if reader_schema is None else reader_schema
+    result = set()
+    for name in references:
+        i, j = physical.get_field_index(name), logical.get_field_index(name)
+        if i < 0:  # Folder-only fields remain usable partition facts.
+            continue
+        before, after = (
+            physical.field(i).type,
+            logical.field(j).type if j >= 0 else None,
+        )
+        if before != after or any(
+            isinstance(t, pa.BaseExtensionType) for t in (before, after)
+        ):
+            result.add(name)
+    if read_options is not None and read_options.coerce_int96_timestamp_unit != "ns":
+        for i in range(len(parquet_schema)):
+            leaf = parquet_schema.column(i)
+            if leaf.physical_type == "INT96":
+                result.update(_get_prefix_matches(leaf.path, references))
+    return frozenset(result)
