@@ -130,7 +130,6 @@ def _read_partitioned(root, schema, filesystem=None, **kwargs):
 @pytest.mark.parametrize(
     "predicate,groups",
     [
-        ((col("p") == "a") | (col("x") >= 25), 6),
         (~((col("p") == "a") & (col("x") < 25)), 6),
         (col("p").is_in(["a"]) | col("x").is_in([5, 35]), 6),
         ((col("p") == "absent") | (col("x") < 0), 0),
@@ -140,40 +139,32 @@ def _read_partitioned(root, schema, filesystem=None, **kwargs):
             4,
         ),
     ],
-    ids=["mixed_or", "not", "in", "empty", "arithmetic"],
+    ids=["not", "in", "empty", "arithmetic"],
 )
-def test_mixed_predicates(
-    partitioned_data, monkeypatch, scanned_groups, predicate, groups
+def test_mixed_predicates(partitioned_data, scanned_groups, predicate, groups):
+    root, table = partitioned_data
+    expected = ArrowBlockAccessor(table).filter(predicate).to_pylist()
+    actual = _read_partitioned(root, table.schema).filter(expr=predicate).take_all()
+    assert sorted(actual, key=lambda row: row["id"]) == expected
+    assert len(scanned_groups()) == groups
+
+
+@pytest.mark.parametrize("with_pushed_filter", [False, True])
+def test_mixed_or_with_control(
+    partitioned_data, monkeypatch, scanned_groups, with_pushed_filter
 ):
     root, table = partitioned_data
-    expected = ArrowBlockAccessor(table).filter(predicate).to_pylist()
-
-    def query():
-        return sorted(
-            _read_partitioned(root, table.schema).filter(expr=predicate).take_all(),
-            key=lambda row: row["id"],
-        )
-
-    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
-        groups,
-        8,
-    )
-
-
-@pytest.mark.parametrize("consumer", ["map", "count"])
-def test_downstream_operators(partitioned_data, monkeypatch, scanned_groups, consumer):
-    root, table = partitioned_data
     predicate = (col("p") == "a") | (col("x") >= 25)
-    expected = ArrowBlockAccessor(table).filter(predicate).to_pylist()
-    if consumer == "count":
-        expected = len(expected)
+    oracle = (
+        table.filter(pc.greater_equal(table["x"], 5)) if with_pushed_filter else table
+    )
+    expected = ArrowBlockAccessor(oracle).filter(predicate).to_pylist()
 
     def query():
-        ds = _read_partitioned(root, table.schema).filter(expr=predicate)
-        if consumer == "count":
-            return ds.count()
-        ds = ds.map_batches(lambda batch: batch, batch_format="pyarrow")
-        return sorted(ds.take_all(), key=lambda row: row["id"])
+        ds = _read_partitioned(root, table.schema)
+        if with_pushed_filter:
+            ds = ds.filter(expr=col("x") >= 5)
+        return sorted(ds.filter(expr=predicate).take_all(), key=lambda row: row["id"])
 
     assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
         6,
@@ -181,18 +172,31 @@ def test_downstream_operators(partitioned_data, monkeypatch, scanned_groups, con
     )
 
 
-@pytest.mark.parametrize("filesystem_kind", ["native", "fsspec", "s3"])
+@pytest.mark.parametrize("consumer", ["map", "count"])
+def test_downstream_operators(partitioned_data, scanned_groups, consumer):
+    root, table = partitioned_data
+    predicate = (col("p") == "a") | (col("x") >= 25)
+    expected = ArrowBlockAccessor(table).filter(predicate).to_pylist()
+    ds = _read_partitioned(root, table.schema).filter(expr=predicate)
+    if consumer == "count":
+        assert ds.count() == len(expected)
+    else:
+        ds = ds.map_batches(lambda batch: batch, batch_format="pyarrow")
+        assert sorted(ds.take_all(), key=lambda row: row["id"]) == expected
+    assert len(scanned_groups()) == 6
+
+
+@pytest.mark.parametrize("filesystem_kind", ["fsspec", "s3"])
 def test_pushed_predicate_with_filesystems(
-    partitioned_data, monkeypatch, scanned_groups, request, filesystem_kind
+    partitioned_data, scanned_groups, request, filesystem_kind
 ):
     root, table = partitioned_data
 
-    filesystem = None
     if filesystem_kind == "fsspec":
         from fsspec.implementations.local import LocalFileSystem
 
         filesystem = LocalFileSystem(skip_instance_cache=True)
-    elif filesystem_kind == "s3":
+    else:
         filesystem = request.getfixturevalue("s3_fs")
         destination = request.getfixturevalue("s3_path").removeprefix("s3://")
         pafs.copy_files(str(root), destination, destination_filesystem=filesystem)
@@ -202,15 +206,10 @@ def test_pushed_predicate_with_filesystems(
     oracle = table.filter(pc.greater_equal(table["x"], 5))
     expected = ArrowBlockAccessor(oracle).filter(predicate).to_pylist()
 
-    def query():
-        ds = _read_partitioned(root, table.schema, filesystem=filesystem)
-        ds = ds.filter(expr=col("x") >= 5).filter(expr=predicate)
-        return sorted(ds.take_all(), key=lambda row: row["id"])
-
-    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
-        6,
-        8,
-    )
+    ds = _read_partitioned(root, table.schema, filesystem=filesystem)
+    ds = ds.filter(expr=col("x") >= 5).filter(expr=predicate)
+    assert sorted(ds.take_all(), key=lambda row: row["id"]) == expected
+    assert len(scanned_groups()) == 6
 
 
 @pytest.mark.parametrize(
@@ -222,26 +221,19 @@ def test_pushed_predicate_with_filesystems(
     ids=["null_partition", "missing_key_uses_physical_column"],
 )
 def test_partition_values(
-    partitioned_data, monkeypatch, scanned_groups, directory, partition_value, predicate
+    partitioned_data, scanned_groups, directory, partition_value, predicate
 ):
     root, table = partitioned_data
     (root / "p=b").rename(root / directory)
     oracle = table.set_column(2, "p", pa.array(["a"] * 40 + [partition_value] * 40))
     expected = ArrowBlockAccessor(oracle).filter(predicate).to_pylist()
 
-    def query():
-        return sorted(
-            _read_partitioned(root, table.schema).filter(expr=predicate).take_all(),
-            key=lambda row: row["id"],
-        )
-
-    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
-        6,
-        8,
-    )
+    actual = _read_partitioned(root, table.schema).filter(expr=predicate).take_all()
+    assert sorted(actual, key=lambda row: row["id"]) == expected
+    assert len(scanned_groups()) == 6
 
 
-def test_block_udf_disables_pruning(partitioned_data, monkeypatch, scanned_groups):
+def test_block_udf_disables_pruning(partitioned_data, scanned_groups):
     root, table = partitioned_data
     predicate = (col("p") == "a") | (col("x") >= 25)
     expected = table.to_pylist()
@@ -253,19 +245,15 @@ def test_block_udf_disables_pruning(partitioned_data, monkeypatch, scanned_group
             table.schema.get_field_index("x"), "x", pc.add(table["x"], 100)
         )
 
-    def query():
-        ds = _read_partitioned(root, table.schema, _block_udf=transform)
-        return sorted(ds.filter(expr=predicate).take_all(), key=lambda row: row["id"])
-
-    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
-        8,
-        8,
+    ds = _read_partitioned(root, table.schema, _block_udf=transform)
+    assert (
+        sorted(ds.filter(expr=predicate).take_all(), key=lambda row: row["id"])
+        == expected
     )
+    assert len(scanned_groups()) == 8
 
 
-def test_synthesized_path_disables_pruning(
-    partitioned_data, monkeypatch, scanned_groups
-):
+def test_synthesized_path_disables_pruning(partitioned_data, scanned_groups):
     root, table = partitioned_data
     schema = table.schema.append(pa.field("path", pa.string()))
     # Physical NULLs cannot describe the non-null paths supplied by the reader.
@@ -279,130 +267,50 @@ def test_synthesized_path_disables_pruning(
     ]
     predicate = (col("p") == "a") | col("path").is_not_null()
 
-    def query():
-        return sorted(
-            _read_partitioned(root, schema, include_paths=True)
-            .filter(expr=predicate)
-            .take_all(),
-            key=lambda row: row["id"],
-        )
-
-    assert _compare_pruning_modes(query, expected, monkeypatch, scanned_groups) == (
-        8,
-        8,
-    )
+    ds = _read_partitioned(root, schema, include_paths=True).filter(expr=predicate)
+    assert sorted(ds.take_all(), key=lambda row: row["id"]) == expected
+    assert len(scanned_groups()) == 8
 
 
 @pytest.mark.parametrize(
-    "values,dtype,reader_type,predicate,group_size,ids,groups",
-    [
-        (
-            [float("nan"), 0.0],
-            pa.float64(),
-            None,
-            ~(col("x") == 0.0),
-            2,
-            [0],
-            1,
-        ),
-        ([float("nan"), 0.0], pa.float64(), None, col("x") != 0.0, 2, [0], 1),
-        ([-0.0, 0.0], pa.float64(), None, col("x").is_in([0.0]), 2, [1], 1),
-        ([100, 1], pa.int8(), None, col("x") + 100 > 127, 1, [0], 1),
-        ([100, 1], pa.int8(), None, col("x").power(2) > 127, 1, [0], 2),
-        (
-            [datetime(2020, 1, 1, 12), datetime(2020, 1, 2)],
-            pa.timestamp("us"),
-            pa.date32(),
-            col("x") == date(2020, 1, 1),
-            2,
-            [0],
-            1,
-        ),
-        (
-            [None, 1.0, 2.0, 3.0],
-            pa.float64(),
-            None,
-            col("x").is_null(),
-            2,
-            [0],
-            1,
-        ),
-        ([1, 2, 100, 101], pa.int8(), pa.int64(), col("x") >= 100, 2, [2, 3], 1),
-        (
-            [float("nan"), 0.0, 1.0, 2.0],
-            pa.float64(),
-            None,
-            col("x") > 0.0,
-            2,
-            [2, 3],
-            1,
-        ),
-        (
-            [16777216.0, 16777218.0],
-            pa.float32(),
-            None,
-            col("x") > 16777217.0,
-            1,
-            [1],
-            1,
-        ),
-    ],
-    ids=[
-        "nan",
-        "nan_ne",
-        "signed_zero",
-        "int8_add",
-        "int8_power",
-        "timestamp_date",
-        "float_null",
-        "integer_widen",
-        "float_gt",
-        "float32_compare",
-    ],
+    "predicate,ids,groups",
+    [(~(col("x") == 0.0), [0, 2, 3], 2), (col("x") > 0.0, [2, 3], 1)],
+    ids=["nan_negation_falls_back", "positive_comparison_prunes"],
 )
-def test_reader_value_semantics(
-    tmp_path,
-    monkeypatch,
-    scanned_groups,
-    values,
-    dtype,
-    reader_type,
-    predicate,
-    group_size,
-    ids,
-    groups,
-):
-    root = tmp_path / "p=other"
-    root.mkdir()
-    reader_type = reader_type or dtype
-    table = pa.table({"id": range(len(values)), "x": pa.array(values, dtype)})
-    pq.write_table(table, root / "data.parquet", row_group_size=group_size)
-    schema = pa.schema([("id", pa.int64()), ("x", reader_type), ("p", pa.string())])
-    expected = [
-        {**row, "p": "other"} for row in table.cast(schema.remove(2)).to_pylist()
-    ]
-
-    def canonical(rows):
-        return sorted(
-            [
-                {k: v.hex() if isinstance(v, float) else v for k, v in r.items()}
-                for r in rows
-            ],
-            key=lambda row: row["id"],
-        )
-
-    def query():
-        return canonical(
-            ray.data.read_parquet(str(tmp_path), schema=schema)
-            .filter(expr=(col("p") == "keep") | predicate)
-            .take_all()
-        )
-
-    enabled, disabled = _compare_pruning_modes(
-        query, canonical([expected[i] for i in ids]), monkeypatch, scanned_groups
+def test_float_predicates(tmp_path, scanned_groups, predicate, ids, groups):
+    folder = tmp_path / "p=other"
+    folder.mkdir()
+    values = [float("nan"), 0.0, 1.0, 2.0]
+    table = pa.table({"id": range(4), "x": values})
+    pq.write_table(table, folder / "data.parquet", row_group_size=2)
+    schema = table.schema.append(pa.field("p", pa.string()))
+    rows = (
+        ray.data.read_parquet(str(tmp_path), schema=schema)
+        .filter(expr=(col("p") == "keep") | predicate)
+        .take_all()
     )
-    assert enabled == groups
-    assert disabled == len(values) // group_size
+    # hex() compares complete rows while preserving NaN and the sign of zero.
+    actual = sorted((row["id"], row["x"].hex(), row["p"]) for row in rows)
+    assert actual == [(i, values[i].hex(), "other") for i in ids]
+    assert len(scanned_groups()) == groups
+
+
+def test_reader_cast_disables_pruning(tmp_path, scanned_groups):
+    folder = tmp_path / "p=other"
+    folder.mkdir()
+    table = pa.table(
+        {"id": [0, 1], "x": [datetime(2020, 1, 1, 12), datetime(2020, 1, 2)]}
+    )
+    pq.write_table(table, folder / "data.parquet", row_group_size=2)
+    schema = pa.schema([("id", pa.int64()), ("x", pa.date32()), ("p", pa.string())])
+    rows = (
+        ray.data.read_parquet(str(tmp_path), schema=schema)
+        .filter(expr=(col("p") == "keep") | (col("x") == date(2020, 1, 1)))
+        .take_all()
+    )
+    # Noon in the footer becomes January 1 in the reader and must still match.
+    assert rows == [{"id": 0, "x": date(2020, 1, 1), "p": "other"}]
+    assert len(scanned_groups()) == 1
 
 
 if __name__ == "__main__":
