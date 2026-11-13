@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import (
@@ -48,20 +47,8 @@ from ray.data._internal.planner.plan_expression.expression_visitors import (
 )
 from ray.data._internal.util import call_with_retry, filesystem_for_sized_opens
 from ray.data.datasource.partitioning import Partitioning
-from ray.data.expressions import (
-    AliasExpr,
-    BinaryExpr,
-    ColumnExpr,
-    LiteralExpr,
-    Operation,
-    UnaryExpr,
-    _PyArrowExpressionVisitor,
-)
 
 if TYPE_CHECKING:
-    from ray.data._internal.datasource_v2.interfaces.synthesized_columns import (
-        SynthesizedColumn,
-    )
     from ray.data.expressions import Expr
 
 
@@ -71,7 +58,6 @@ class ResidualPruning(NamedTuple):
     predicate: Expr
     partitioning: Partitioning
     schema: pa.Schema
-    synthesized_columns: tuple[SynthesizedColumn, ...]
 
 
 logger = logging.getLogger(__name__)
@@ -192,19 +178,14 @@ class FooterReader:
         )
         self.residual_pruning = residual_pruning
         self._residual_partition_value_parser = None
+        self._residual_filter = None
         if residual_pruning is not None:
             try:
-                if self._predicate is not None:
-                    # Shared partition facts must not rebind hidden pushed fields.
-                    _validate_expression_references(
-                        self._predicate, residual_pruning.schema
-                    )
+                self._residual_filter = residual_pruning.predicate.to_pyarrow()
                 self._residual_partition_value_parser = _PartitionValueParser(
                     residual_pruning.partitioning
                 )
             except Exception as e:
-                # Q's parser initialization above must still raise normally;
-                # only initialization needed exclusively by R is optional.
                 logger.debug(
                     "Disabling residual pruning during initialization: %s",
                     e,
@@ -441,21 +422,12 @@ class FooterReader:
         try:
             pruning = self.residual_pruning
             references = set(get_column_references(pruning.predicate))
-            if references & {column.name for column in pruning.synthesized_columns}:
-                return None
             # Missing keys may be physical columns; never infer NULL from absence.
             values = {k: v for k, v in parser(path).items() if k in references}
             table = _partition_table(values, pruning.schema)
             partition_expression = pds.scalar(True)
             for name in values:
                 scalar = table[name][0]
-                if (
-                    scalar.is_valid
-                    and pa.types.is_floating(scalar.type)
-                    and math.isnan(scalar.as_py())
-                ):
-                    # NaN == NaN cannot be used as a true partition fact.
-                    return None
                 fact = (
                     pds.field(name) == pds.scalar(scalar)
                     if scalar.is_valid
@@ -489,16 +461,15 @@ class FooterReader:
             pruning = self.residual_pruning
             _, partition_columns = facts
             references = set(get_column_references(pruning.predicate))
-            unknown_columns = (
-                reader_unknown_columns(schema, pruning.schema, references)
-                - partition_columns
-            )
-            _validate_residual_expression(
-                pruning.predicate, pruning.schema, unknown_columns
-            )
-            bound = _PyArrowExpressionVisitor(preserve_scalar_types=True).visit(
-                pruning.predicate
-            )
+            physical_schema = schema.to_arrow_schema()
+            # Like the pushed filter, use bounds only for unchanged field types.
+            # Partition values come from the path and override physical columns.
+            if any(
+                physical_schema.field(name).type != pruning.schema.field(name).type
+                for name in references - partition_columns
+                if name in physical_schema.names
+            ):
+                return None
             # Share the already-read metadata, but give R its own statistics
             # cache when binding against the reader's logical schema.
             fragment = fragment.subset(row_group_ids=candidates)
@@ -511,7 +482,7 @@ class FooterReader:
             )
             return None
         return self._try_split_by_row_group(
-            fragment, bound, fragment.path, pruning.schema
+            fragment, self._residual_filter, fragment.path, pruning.schema
         )
 
     def _read_and_chunk(self, file: FileInfo) -> ChunkedFile:
@@ -683,93 +654,3 @@ class FooterReader:
 
 
 FooterReaderActor = ray.remote(FooterReader)
-
-
-def _expression_leaves(expr: Expr) -> Iterator[tuple[ColumnExpr | LiteralExpr, bool]]:
-    """Yield visible leaves and whether their use permits floating statistics."""
-
-    def visit(e, under_not=False, allow_float=False):
-        if isinstance(e, AliasExpr):
-            yield from visit(e.expr, under_not, allow_float)
-        elif isinstance(e, (ColumnExpr, LiteralExpr)):
-            yield e, allow_float
-        elif (
-            isinstance(e, UnaryExpr)
-            and e.op in (Operation.IS_NULL, Operation.IS_NOT_NULL)
-            and isinstance(e.operand, ColumnExpr)
-        ):
-            # Nullness does not depend on floating-point comparison semantics.
-            yield e.operand, True
-        elif isinstance(e, UnaryExpr):
-            yield from visit(e.operand, under_not or e.op == Operation.NOT)
-        elif isinstance(e, BinaryExpr):
-            # NaNs cannot match positive comparisons. Negation/!= can retain
-            # them despite min/max ignoring them; IN also distinguishes zeros.
-            allow_float = not under_not and e.op in (
-                Operation.EQ,
-                Operation.LT,
-                Operation.LE,
-                Operation.GT,
-                Operation.GE,
-            )
-            yield from visit(e.left, under_not, allow_float)
-            if e.op not in (Operation.IN, Operation.NOT_IN):
-                yield from visit(e.right, under_not, allow_float)
-        else:
-            # UDFs can depend on the batch, or pass untyped operands straight to
-            # Arrow (e.g. int8.power(2)); neither is equivalent to eager filtering.
-            raise ValueError("Non-row-local or opaque expression")
-
-    return visit(expr)
-
-
-def _validate_expression_references(expr: Expr, schema: pa.Schema) -> None:
-    """Require schema-bound columns and literal operands, rejecting opaque calls.
-
-    The pushed predicate needs this check before sharing partition facts, but
-    its existing statistics behavior must not depend on residual-only guards.
-    """
-    for leaf, _ in _expression_leaves(expr):
-        if isinstance(leaf, ColumnExpr):
-            schema.field(leaf.name)
-        else:
-            pa.scalar(leaf.value)
-
-
-def _validate_residual_expression(
-    expr: Expr, schema: pa.Schema, unknown_columns=frozenset()
-) -> Expr:
-    """Use native statistics only for an unchanged, row-local expression.
-
-    Unsafe expressions disable this optional hint as a whole. The original
-    pushed predicate and residual Filter still run, so this costs only pruning.
-    """
-    for leaf, allow_float in _expression_leaves(expr):
-        if isinstance(leaf, ColumnExpr):
-            if leaf.name in unknown_columns:
-                raise ValueError("Reader changes the column domain")
-            dtype = schema.field(leaf.name).type
-        else:
-            dtype = pa.scalar(leaf.value).type
-        if pa.types.is_floating(dtype) and not allow_float:
-            raise ValueError("Unsafe statistics value domain")
-    return expr
-
-
-def reader_unknown_columns(parquet_schema, reader_schema, references):
-    """Footer bounds must describe the reader's values, not pre-cast values."""
-    physical = parquet_schema.to_arrow_schema()
-    result = set()
-    for name in references:
-        if physical.get_field_index(name) < 0:
-            # Folder-only fields remain usable partition facts.
-            continue
-        before, after = physical.field(name).type, reader_schema.field(name).type
-        integer_widening = (
-            pa.types.is_integer(before)
-            and pa.types.is_integer(after)
-            and before.bit_width < after.bit_width
-        )
-        if before != after and not integer_widening:
-            result.add(name)
-    return frozenset(result)

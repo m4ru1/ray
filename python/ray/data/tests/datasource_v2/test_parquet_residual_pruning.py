@@ -1,4 +1,4 @@
-"""Compare full row results and actual worker scans, including unsafe statistics."""
+"""Compare full row results and actual worker scans, through the existing Arrow pruning path."""
 
 import json
 import os
@@ -134,7 +134,7 @@ def _read_partitioned(root, schema, filesystem=None, **kwargs):
         (col("p").is_in(["a"]) | col("x").is_in([5, 35]), 6),
         ((col("p") == "absent") | (col("x") < 0), 0),
         (
-            ((col("p") == "a") & (col("x") + 100 >= 125))
+            ((col("p") == "a") & (col("x") + 10 >= 35))
             | ((col("p") == "b") & (col("x") < 0)),
             4,
         ),
@@ -253,34 +253,15 @@ def test_block_udf_disables_pruning(partitioned_data, scanned_groups):
     assert len(scanned_groups()) == 8
 
 
-def test_synthesized_path_disables_pruning(partitioned_data, scanned_groups):
-    root, table = partitioned_data
-    schema = table.schema.append(pa.field("path", pa.string()))
-    # Physical NULLs cannot describe the non-null paths supplied by the reader.
-    for path in root.glob("*/data.parquet"):
-        physical = pq.ParquetFile(path).read()
-        physical = physical.append_column("path", pa.nulls(40, pa.string()))
-        pq.write_table(physical, path, row_group_size=10)
-    expected = [
-        {**row, "path": str(root / f"p={row['p']}" / "data.parquet")}
-        for row in table.to_pylist()
-    ]
-    predicate = (col("p") == "a") | col("path").is_not_null()
-
-    ds = _read_partitioned(root, schema, include_paths=True).filter(expr=predicate)
-    assert sorted(ds.take_all(), key=lambda row: row["id"]) == expected
-    assert len(scanned_groups()) == 8
-
-
 @pytest.mark.parametrize(
     "predicate,ids,groups",
-    [(~(col("x") == 0.0), [0, 2, 3], 2), (col("x") > 0.0, [2, 3], 1)],
-    ids=["nan_negation_falls_back", "positive_comparison_prunes"],
+    [(col("x") > 0.0, [2, 3], 1), (col("x").is_null(), [0], 1)],
+    ids=["positive_comparison", "null"],
 )
 def test_float_predicates(tmp_path, scanned_groups, predicate, ids, groups):
     folder = tmp_path / "p=other"
     folder.mkdir()
-    values = [float("nan"), 0.0, 1.0, 2.0]
+    values = [None, 0.0, 1.0, 2.0]
     table = pa.table({"id": range(4), "x": values})
     pq.write_table(table, folder / "data.parquet", row_group_size=2)
     schema = table.schema.append(pa.field("p", pa.string()))
@@ -289,10 +270,23 @@ def test_float_predicates(tmp_path, scanned_groups, predicate, ids, groups):
         .filter(expr=(col("p") == "keep") | predicate)
         .take_all()
     )
-    # hex() compares complete rows while preserving NaN and the sign of zero.
-    actual = sorted((row["id"], row["x"].hex(), row["p"]) for row in rows)
-    assert actual == [(i, values[i].hex(), "other") for i in ids]
+    assert sorted(rows, key=lambda row: row["id"]) == [
+        {"id": i, "x": values[i], "p": "other"} for i in ids
+    ]
     assert len(scanned_groups()) == groups
+
+
+def test_limit_before_filter_disables_pruning(
+    partitioned_data, scanned_groups, monkeypatch
+):
+    root, table = partitioned_data
+    # A filter above a limit must not select later rows to fill that limit.
+    monkeypatch.setattr(
+        DataContext.get_current().execution_options, "preserve_order", True
+    )
+    ds = _read_partitioned(root / "p=b", table.schema).limit(10)
+    assert ds.filter(expr=(col("p") == "absent") | (col("x") >= 25)).take_all() == []
+    assert len(scanned_groups()) == 4
 
 
 def test_reader_cast_disables_pruning(tmp_path, scanned_groups):

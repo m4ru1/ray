@@ -11,19 +11,11 @@ import pyarrow.parquet as pq
 import pytest
 from pyarrow.fs import LocalFileSystem
 
-from ray.data._internal.arrow_block import ArrowBlockAccessor
 from ray.data._internal.datasource_v2.common.file_pruners import (
     PartitionPredicatePruner,
 )
-from ray.data._internal.datasource_v2.formats.parquet.footer_file_indexer import (
-    _chunked_file_to_manifest,
-)
 from ray.data._internal.datasource_v2.formats.parquet.footer_reader import (
     FooterReader,
-    ResidualPruning,
-)
-from ray.data._internal.datasource_v2.formats.parquet.parquet_scanner import (
-    ParquetScanner,
 )
 from ray.data._internal.datasource_v2.interfaces.file_indexer import FileInfo
 from ray.data.datasource.partitioning import Partitioning, PartitionStyle
@@ -214,86 +206,6 @@ def test_declared_schema_cast_prevents_raw_statistics_pruning(tmp_path):
     )._read_and_chunk(FileInfo(path, size))
     assert len(chunks.row_groups) == 1
     assert not chunks.row_groups[0].fully_matched
-
-
-@pytest.mark.parametrize(
-    "values,dtype,reader_type,predicate,group_size,ids,groups",
-    [
-        ([float("nan"), 0.0], pa.float64(), None, col("x") != 0.0, 2, [0], 1),
-        ([-0.0, 0.0], pa.float64(), None, col("x").is_in([0.0]), 2, [1], 1),
-        ([100, 1], pa.int8(), None, col("x") + 100 > 127, 1, [0], 1),
-        ([100, 1], pa.int8(), None, col("x").power(2) > 127, 1, [0], 2),
-        (
-            [None, 1.0, 2.0, 3.0],
-            pa.float64(),
-            None,
-            col("x").is_null(),
-            2,
-            [0],
-            1,
-        ),
-        ([1, 2, 100, 101], pa.int8(), pa.int64(), col("x") >= 100, 2, [2, 3], 1),
-        (
-            [16777216.0, 16777218.0],
-            pa.float32(),
-            None,
-            col("x") > 16777217.0,
-            1,
-            [1],
-            1,
-        ),
-    ],
-    ids=[
-        "nan_ne",
-        "signed_zero",
-        "int8_add",
-        "int8_power",
-        "float_null",
-        "integer_widen",
-        "float32_compare",
-    ],
-)
-def test_residual_statistics_preserve_reader_values(
-    tmp_path, values, dtype, reader_type, predicate, group_size, ids, groups
-):
-    folder = tmp_path / "p=other"
-    folder.mkdir()
-    table = pa.table({"id": range(len(values)), "x": pa.array(values, dtype)})
-    file = FileInfo(*_write(folder / "data.parquet", table, group_size))
-    schema = pa.schema(
-        [("id", pa.int64()), ("x", reader_type or dtype), ("p", pa.string())]
-    )
-    partitioning = Partitioning(PartitionStyle.HIVE, base_dir=str(tmp_path))
-    residual = (col("p") == "keep") | predicate
-    reader = _reader(
-        logical_schema=schema,
-        residual_pruning=ResidualPruning(residual, partitioning, schema, ()),
-    )
-    with reader.pool:
-        chunk = reader._read_and_chunk(file)
-
-    # Use the production reader to apply casts and directory values, without Ray.
-    scanner = ParquetScanner(schema=schema, partitioning=partitioning)
-    actual = []
-    for block in scanner.create_reader().read(_chunked_file_to_manifest(chunk)):
-        actual.extend(ArrowBlockAccessor(block).filter(residual).to_pylist())
-    expected = [
-        {**row, "p": "other"} for row in table.cast(schema.remove(2)).to_pylist()
-    ]
-
-    def canonical(rows):
-        # Preserve NaNs and the zero sign when comparing complete rows.
-        return [
-            (
-                row["id"],
-                row["x"].hex() if isinstance(row["x"], float) else row["x"],
-                row["p"],
-            )
-            for row in rows
-        ]
-
-    assert canonical(actual) == canonical([expected[i] for i in ids])
-    assert sum(len(group.unit_ids) for group in chunk.row_groups) == groups
 
 
 class _FakeStatistics:

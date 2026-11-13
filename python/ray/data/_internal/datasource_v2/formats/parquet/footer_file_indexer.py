@@ -235,7 +235,6 @@ class FooterFileIndexer(NonSamplingFileIndexer):
                 predicate=residual,
                 partitioning=scanner.partitioning,
                 schema=scanner.schema,
-                synthesized_columns=tuple(scanner.synthesized_columns),
             )
         return configured
 
